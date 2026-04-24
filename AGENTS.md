@@ -50,3 +50,8 @@ fixes #123
 - Include a suggestion with each discovered item
 - Limit your code review to three items with the highest priority first
 - Double check your discovered items and recommended remediations
+
+## Coding rules
+
+- apply DRY, reuse code as much as possible without introducing high business coupling
+- keep low cognitive complexity; short functions having clear responsibility

@@ -316,6 +316,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			modelConfig.Filters.StripParams = strings.ReplaceAll(modelConfig.Filters.StripParams, macroSlug, macroStr)
 			modelConfig.Name = strings.ReplaceAll(modelConfig.Name, macroSlug, macroStr)
 			modelConfig.Description = strings.ReplaceAll(modelConfig.Description, macroSlug, macroStr)
+			modelConfig.SleepWake.SleepEndpoint = strings.ReplaceAll(modelConfig.SleepWake.SleepEndpoint, macroSlug, macroStr)
+			modelConfig.SleepWake.WakeEndpoint = strings.ReplaceAll(modelConfig.SleepWake.WakeEndpoint, macroSlug, macroStr)
+			modelConfig.SleepWake.IsSleepingEndpoint = strings.ReplaceAll(modelConfig.SleepWake.IsSleepingEndpoint, macroSlug, macroStr)
 
 			// Substitute macros in SetParamsByID keys and values
 			if len(modelConfig.Filters.SetParamsByID) > 0 {
@@ -361,6 +364,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			modelConfig.Proxy = strings.ReplaceAll(modelConfig.Proxy, macroSlug, macroStr)
 			modelConfig.Name = strings.ReplaceAll(modelConfig.Name, macroSlug, macroStr)
 			modelConfig.Description = strings.ReplaceAll(modelConfig.Description, macroSlug, macroStr)
+			modelConfig.SleepWake.SleepEndpoint = strings.ReplaceAll(modelConfig.SleepWake.SleepEndpoint, macroSlug, macroStr)
+			modelConfig.SleepWake.WakeEndpoint = strings.ReplaceAll(modelConfig.SleepWake.WakeEndpoint, macroSlug, macroStr)
+			modelConfig.SleepWake.IsSleepingEndpoint = strings.ReplaceAll(modelConfig.SleepWake.IsSleepingEndpoint, macroSlug, macroStr)
 
 			if len(modelConfig.Metadata) > 0 {
 				result, err := substituteMacroInValue(modelConfig.Metadata, "PORT", nextPort)
@@ -375,13 +381,16 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 
 		// Validate no unknown macros remain
 		fieldMap := map[string]string{
-			"cmd":                 modelConfig.Cmd,
-			"cmdStop":             modelConfig.CmdStop,
-			"proxy":               modelConfig.Proxy,
-			"checkEndpoint":       modelConfig.CheckEndpoint,
-			"filters.stripParams": modelConfig.Filters.StripParams,
-			"name":                modelConfig.Name,
-			"description":         modelConfig.Description,
+			"cmd":                          modelConfig.Cmd,
+			"cmdStop":                      modelConfig.CmdStop,
+			"proxy":                        modelConfig.Proxy,
+			"checkEndpoint":                modelConfig.CheckEndpoint,
+			"filters.stripParams":          modelConfig.Filters.StripParams,
+			"name":                         modelConfig.Name,
+			"description":                  modelConfig.Description,
+			"sleepWake.sleepEndpoint":      modelConfig.SleepWake.SleepEndpoint,
+			"sleepWake.wakeEndpoint":       modelConfig.SleepWake.WakeEndpoint,
+			"sleepWake.isSleepingEndpoint": modelConfig.SleepWake.IsSleepingEndpoint,
 		}
 
 		for fieldName, fieldValue := range fieldMap {

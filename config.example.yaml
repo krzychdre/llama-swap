@@ -309,6 +309,20 @@ models:
     unlisted: true
     cmd: llama-server --port ${PORT} -m Llama-3.2-1B-Instruct-Q4_K_M.gguf -ngl 0
 
+  # Sleep/wake example (vLLM):
+  # sleep/wake allows keeping the process alive while freeing VRAM during model swaps.
+  # Instead of stopping the process, llama-swap sends POST requests to sleep/wake endpoints.
+  "vllm-qwen":
+    cmd: vllm serve Qwen/Qwen2.5-32B-Instruct --port ${PORT}
+    proxy: "http://localhost:${PORT}"
+    sleepWake:
+      enabled: true
+      # sleepEndpoint: "/sleep"         # POST to free VRAM (default: /sleep)
+      # wakeEndpoint: "/wake_up"        # POST to reload into VRAM (default: /wake_up)
+      # isSleepingEndpoint: "/is_sleeping"  # GET to check sleep state (default: /is_sleeping)
+      # sleepVerifyTimeout: 15          # seconds to wait for sleep confirmation (default: 15)
+      # wakeVerifyTimeout: 15           # seconds to wait for wake health check (default: 15)
+
   # Docker example:
   # container runtimes like Docker and Podman can be used reliably with
   # a combination of cmd, cmdStop, and ${MODEL_ID}

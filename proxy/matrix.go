@@ -224,7 +224,11 @@ func (m *Matrix) ProxyRequest(modelID string, w http.ResponseWriter, r *http.Req
 				wg.Add(1)
 				go func(p *Process) {
 					defer wg.Done()
-					p.Stop()
+					if p.IsSleepWakeEnabled() {
+						p.Sleep()
+					} else {
+						p.Stop()
+					}
 				}(p)
 			}
 		}
@@ -304,11 +308,24 @@ func (m *Matrix) RunningModels() []string {
 	return m.runningModels()
 }
 
+func (m *Matrix) ActiveModels() []string {
+	m.Lock()
+	defer m.Unlock()
+	var active []string
+	for id, process := range m.processes {
+		if process.CurrentState() != StateStopped && process.CurrentState() != StateShutdown {
+			active = append(active, id)
+		}
+	}
+	sort.Strings(active)
+	return active
+}
+
 // runningModels returns running model names (caller must hold lock).
 func (m *Matrix) runningModels() []string {
 	var running []string
 	for id, process := range m.processes {
-		if process.CurrentState() != StateStopped && process.CurrentState() != StateShutdown {
+		if process.CurrentState() == StateReady || process.CurrentState() == StateStarting || process.CurrentState() == StateWaking {
 			running = append(running, id)
 		}
 	}

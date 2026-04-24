@@ -147,6 +147,14 @@
     @apply bg-error/10 text-error;
   }
 
+  .status--sleeping {
+    @apply bg-blue-500/10 text-blue-500;
+  }
+
+  .status--waking {
+    @apply bg-warning/10 text-warning;
+  }
+
   /* Buttons */
   .btn {
     @apply bg-surface py-2 px-4 text-sm rounded-md border transition-colors duration-200 border-btn-border;

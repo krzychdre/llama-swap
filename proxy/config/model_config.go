@@ -20,6 +20,15 @@ type TimeoutsConfig struct {
 	IdleConn       int `yaml:"idleConn"`
 }
 
+type SleepWakeConfig struct {
+	Enabled            bool   `yaml:"enabled"`
+	SleepEndpoint      string `yaml:"sleepEndpoint"`
+	WakeEndpoint       string `yaml:"wakeEndpoint"`
+	IsSleepingEndpoint string `yaml:"isSleepingEndpoint"`
+	SleepVerifyTimeout int    `yaml:"sleepVerifyTimeout"` // seconds to wait for IsSleeping confirmation after sleep POST
+	WakeVerifyTimeout  int    `yaml:"wakeVerifyTimeout"`  // seconds to wait for health check after wake POST
+}
+
 type ModelConfig struct {
 	Cmd           string   `yaml:"cmd"`
 	CmdStop       string   `yaml:"cmdStop"`
@@ -54,6 +63,9 @@ type ModelConfig struct {
 
 	// Timeout settings for proxy connections
 	Timeouts TimeoutsConfig `yaml:"timeouts"`
+
+	// Sleep/wake support for vLLM models
+	SleepWake SleepWakeConfig `yaml:"sleepWake"`
 }
 
 func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -80,6 +92,14 @@ func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 			TLSHandshake:   10,
 			ExpectContinue: 1,
 			IdleConn:       90,
+		},
+		SleepWake: SleepWakeConfig{
+			Enabled:            false,
+			SleepEndpoint:      "/sleep",
+			WakeEndpoint:       "/wake_up",
+			IsSleepingEndpoint: "/is_sleeping",
+			SleepVerifyTimeout: 15,
+			WakeVerifyTimeout:  15,
 		},
 	}
 

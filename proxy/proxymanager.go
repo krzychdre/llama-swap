@@ -1098,7 +1098,7 @@ func (pm *ProxyManager) listRunningProcessesHandler(context *gin.Context) {
 	runningProcesses := make([]gin.H, 0) // Default to an empty response.
 
 	if pm.matrix != nil {
-		for _, modelID := range pm.matrix.RunningModels() {
+		for _, modelID := range pm.matrix.ActiveModels() {
 			if process, ok := pm.matrix.GetProcess(modelID); ok {
 				runningProcesses = append(runningProcesses, gin.H{
 					"model":       process.ID,
@@ -1114,7 +1114,7 @@ func (pm *ProxyManager) listRunningProcessesHandler(context *gin.Context) {
 	} else {
 		for _, processGroup := range pm.processGroups {
 			for _, process := range processGroup.processes {
-				if process.CurrentState() == StateReady {
+				if process.CurrentState() == StateReady || process.CurrentState() == StateSleeping || process.CurrentState() == StateWaking {
 					runningProcesses = append(runningProcesses, gin.H{
 						"model":       process.ID,
 						"state":       process.state,

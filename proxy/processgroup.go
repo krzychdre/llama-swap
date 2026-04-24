@@ -89,7 +89,12 @@ func (pg *ProcessGroup) ProxyRequest(modelID string, writer http.ResponseWriter,
 
 			// is there something already running?
 			if pg.lastUsedProcess != "" {
-				pg.processes[pg.lastUsedProcess].Stop()
+				prevProcess := pg.processes[pg.lastUsedProcess]
+				if prevProcess.IsSleepWakeEnabled() {
+					prevProcess.Sleep()
+				} else {
+					prevProcess.Stop()
+				}
 			}
 
 			// wait for the request to the new model to be fully handled

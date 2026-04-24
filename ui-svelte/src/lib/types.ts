@@ -1,6 +1,6 @@
 export type ConnectionState = "connected" | "connecting" | "disconnected";
 
-export type ModelStatus = "ready" | "starting" | "stopping" | "stopped" | "shutdown" | "unknown";
+export type ModelStatus = "ready" | "starting" | "stopping" | "stopped" | "shutdown" | "sleeping" | "waking" | "unknown";
 
 export interface Model {
   id: string;
@@ -10,6 +10,7 @@ export interface Model {
   unlisted: boolean;
   peerID: string;
   aliases?: string[];
+  sleepWakeEnabled?: boolean;
 }
 
 export interface Metrics {

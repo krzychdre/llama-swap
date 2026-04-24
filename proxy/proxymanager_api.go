@@ -8,19 +8,21 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/mostlygeek/llama-swap/event"
 )
 
 type Model struct {
-	Id          string   `json:"id"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	State       string   `json:"state"`
-	Unlisted    bool     `json:"unlisted"`
-	PeerID      string   `json:"peerID"`
-	Aliases     []string `json:"aliases,omitempty"`
+	Id               string   `json:"id"`
+	Name             string   `json:"name"`
+	Description      string   `json:"description"`
+	State            string   `json:"state"`
+	Unlisted         bool     `json:"unlisted"`
+	PeerID           string   `json:"peerID"`
+	Aliases          []string `json:"aliases,omitempty"`
+	SleepWakeEnabled bool     `json:"sleepWakeEnabled,omitempty"`
 }
 
 func addApiHandlers(pm *ProxyManager) {
@@ -34,6 +36,8 @@ func addApiHandlers(pm *ProxyManager) {
 		apiGroup.GET("/metrics", pm.apiGetMetrics)
 		apiGroup.GET("/version", pm.apiGetVersion)
 		apiGroup.GET("/captures/:id", pm.apiGetCapture)
+		apiGroup.POST("/models/sleep/*model", pm.apiSleepModelHandler)
+		apiGroup.POST("/models/wake/*model", pm.apiWakeModelHandler)
 	}
 }
 
@@ -77,15 +81,20 @@ func (pm *ProxyManager) getModelStatus() []Model {
 				state = "shutdown"
 			case StateStopped:
 				state = "stopped"
+			case StateSleeping:
+				state = "sleeping"
+			case StateWaking:
+				state = "waking"
 			}
 		}
 		models = append(models, Model{
-			Id:          modelID,
-			Name:        pm.config.Models[modelID].Name,
-			Description: pm.config.Models[modelID].Description,
-			State:       state,
-			Unlisted:    pm.config.Models[modelID].Unlisted,
-			Aliases:     pm.config.Models[modelID].Aliases,
+			Id:               modelID,
+			Name:             pm.config.Models[modelID].Name,
+			Description:      pm.config.Models[modelID].Description,
+			State:            state,
+			Unlisted:         pm.config.Models[modelID].Unlisted,
+			Aliases:          pm.config.Models[modelID].Aliases,
+			SleepWakeEnabled: pm.config.Models[modelID].SleepWake.Enabled,
 		})
 	}
 
@@ -280,6 +289,157 @@ func (pm *ProxyManager) apiGetVersion(c *gin.Context) {
 		"commit":     pm.commit,
 		"build_date": pm.buildDate,
 	})
+}
+
+func (pm *ProxyManager) getProcessForModel(requestedModel string) (*Process, error) {
+	realModelName, found := pm.config.RealModelName(requestedModel)
+	if !found {
+		return nil, fmt.Errorf("model not found")
+	}
+
+	if pm.matrix != nil {
+		process, _ := pm.matrix.GetProcess(realModelName)
+		if process == nil {
+			return nil, fmt.Errorf("process not found for model %s", requestedModel)
+		}
+		return process, nil
+	}
+
+	processGroup := pm.findGroupByModelName(realModelName)
+	if processGroup == nil {
+		return nil, fmt.Errorf("process group not found for model %s", requestedModel)
+	}
+	process := processGroup.processes[realModelName]
+	if process == nil {
+		return nil, fmt.Errorf("process not found for model %s", requestedModel)
+	}
+	return process, nil
+}
+
+func (pm *ProxyManager) apiSleepModelHandler(c *gin.Context) {
+	requestedModel := strings.TrimPrefix(c.Param("model"), "/")
+	process, err := pm.getProcessForModel(requestedModel)
+	if err != nil {
+		pm.sendErrorResponse(c, http.StatusNotFound, err.Error())
+		return
+	}
+
+	if !process.IsSleepWakeEnabled() {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "model does not support sleep/wake")
+		return
+	}
+
+	go process.Sleep()
+	c.String(http.StatusOK, "OK")
+}
+
+func (pm *ProxyManager) apiWakeModelHandler(c *gin.Context) {
+	requestedModel := strings.TrimPrefix(c.Param("model"), "/")
+	realModelName, found := pm.config.RealModelName(requestedModel)
+	if !found {
+		pm.sendErrorResponse(c, http.StatusNotFound, "Model not found")
+		return
+	}
+
+	var process *Process
+	if pm.matrix != nil {
+		p, ok := pm.matrix.GetProcess(realModelName)
+		if !ok {
+			pm.sendErrorResponse(c, http.StatusNotFound, fmt.Sprintf("process not found for model %s", requestedModel))
+			return
+		}
+		process = p
+	} else {
+		p, err := pm.getProcessForModel(requestedModel)
+		if err != nil {
+			pm.sendErrorResponse(c, http.StatusNotFound, err.Error())
+			return
+		}
+		process = p
+	}
+
+	if !process.IsSleepWakeEnabled() {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "model does not support sleep/wake")
+		return
+	}
+
+	go func() {
+		if process.CurrentState() != StateSleeping {
+			return
+		}
+
+		// Evict competing models before waking, same as a normal request would
+		if pm.matrix != nil {
+			pm.evictForMatrixWake(realModelName)
+		} else {
+			pm.evictForGroupWake(realModelName)
+		}
+
+		process.wake()
+	}()
+	c.String(http.StatusOK, "OK")
+}
+
+// evictForGroupWake stops the currently active model in the process group
+// so the waking model can use the VRAM.
+func (pm *ProxyManager) evictForGroupWake(modelID string) {
+	processGroup := pm.findGroupByModelName(modelID)
+	if processGroup == nil {
+		return
+	}
+
+	processGroup.Lock()
+	if processGroup.lastUsedProcess != "" && processGroup.lastUsedProcess != modelID {
+		prevProcess := processGroup.processes[processGroup.lastUsedProcess]
+		if prevProcess != nil {
+			if prevProcess.IsSleepWakeEnabled() {
+				prevProcess.Sleep()
+			} else {
+				prevProcess.Stop()
+			}
+		}
+	}
+	processGroup.lastUsedProcess = modelID
+	processGroup.Unlock()
+}
+
+// evictForMatrixWake uses the solver to determine which running models
+// need to be stopped so the waking model can use the VRAM.
+func (pm *ProxyManager) evictForMatrixWake(modelID string) {
+	if pm.matrix == nil {
+		return
+	}
+
+	pm.matrix.Lock()
+	running := pm.matrix.runningModels()
+	result, err := pm.matrix.solver.Solve(modelID, running)
+	if err != nil {
+		pm.matrix.Unlock()
+		pm.proxyLogger.Errorf("Matrix wake eviction solver error for %s: %v", modelID, err)
+		return
+	}
+
+	if len(result.Evict) > 0 {
+		pm.matrix.inflight.Wait()
+
+		var wg sync.WaitGroup
+		for _, evictModel := range result.Evict {
+			if p, exists := pm.matrix.processes[evictModel]; exists {
+				wg.Add(1)
+				go func(p *Process) {
+					defer wg.Done()
+					if p.IsSleepWakeEnabled() {
+						p.Sleep()
+					} else {
+						p.Stop()
+					}
+				}(p)
+			}
+		}
+		wg.Wait()
+	}
+
+	pm.matrix.Unlock()
 }
 
 func (pm *ProxyManager) apiGetCapture(c *gin.Context) {

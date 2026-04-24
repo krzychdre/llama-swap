@@ -28,6 +28,8 @@ const (
 	StateStarting ProcessState = ProcessState("starting")
 	StateReady    ProcessState = ProcessState("ready")
 	StateStopping ProcessState = ProcessState("stopping")
+	StateSleeping ProcessState = ProcessState("sleeping")
+	StateWaking   ProcessState = ProcessState("waking")
 
 	// process is shutdown and will not be restarted
 	StateShutdown ProcessState = ProcessState("shutdown")
@@ -210,11 +212,15 @@ func isValidTransition(from, to ProcessState) bool {
 	case StateStarting:
 		return to == StateReady || to == StateStopping || to == StateStopped
 	case StateReady:
-		return to == StateStopping
+		return to == StateStopping || to == StateSleeping
+	case StateSleeping:
+		return to == StateWaking || to == StateStopping
+	case StateWaking:
+		return to == StateReady || to == StateStopping || to == StateSleeping
 	case StateStopping:
 		return to == StateStopped || to == StateShutdown
 	case StateShutdown:
-		return false // No transitions allowed from these states
+		return false
 	}
 	return false
 }
@@ -284,6 +290,12 @@ func (p *Process) start() error {
 
 	if p.config.Proxy == "" {
 		return fmt.Errorf("can not start(), upstream proxy missing")
+	}
+
+	// Fast path for sleep/wake: if the process is sleeping, wake it instead of
+	// starting a new subprocess.
+	if p.CurrentState() == StateSleeping {
+		return p.wake()
 	}
 
 	args, err := p.config.SanitizedCommand()
@@ -415,7 +427,11 @@ func (p *Process) start() error {
 
 				if time.Since(p.getLastRequestHandled()) > maxDuration {
 					p.proxyLogger.Infof("<%s> Unloading model, TTL of %ds reached", p.ID, p.config.UnloadAfter)
-					p.Stop()
+					if p.config.SleepWake.Enabled {
+						p.Sleep()
+					} else {
+						p.Stop()
+					}
 					return
 				}
 			}
@@ -477,6 +493,228 @@ func (p *Process) Shutdown() {
 	p.stopCommand()
 	// just force it to this state since there is no recovery from shutdown
 	p.forceState(StateShutdown)
+}
+
+// IsSleepWakeEnabled returns true if this model has sleep/wake support configured.
+func (p *Process) IsSleepWakeEnabled() bool {
+	return p.config.SleepWake.Enabled
+}
+
+// Sleep puts the model to sleep by sending a POST to the sleep endpoint.
+// This frees VRAM while keeping the process alive. Falls back to Stop() if
+// sleep is not enabled or fails.
+func (p *Process) Sleep() {
+	if !p.config.SleepWake.Enabled {
+		p.Stop()
+		return
+	}
+
+	if !isValidTransition(p.CurrentState(), StateSleeping) {
+		p.proxyLogger.Debugf("<%s> Sleep() suppressing invalid transition from %s to StateSleeping", p.ID, p.CurrentState())
+		return
+	}
+
+	// wait for inflight requests before sleeping
+	p.proxyLogger.Debugf("<%s> Sleep(): Waiting for inflight requests to complete", p.ID)
+	p.inFlightRequests.Wait()
+
+	sleepURL, err := url.JoinPath(p.config.Proxy, p.config.SleepWake.SleepEndpoint)
+	if err != nil {
+		p.proxyLogger.Errorf("<%s> failed to build sleep URL: %v, falling back to Stop()", p.ID, err)
+		p.Stop()
+		return
+	}
+
+	// Send sleep request — vLLM blocks until VRAM is actually freed.
+	// Keep state as Ready during the POST so the GUI reflects reality.
+	p.proxyLogger.Infof("<%s> Sending sleep request to %s", p.ID, sleepURL)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post(sleepURL, "", nil)
+	if err != nil {
+		p.proxyLogger.Errorf("<%s> Sleep request failed: %v, falling back to Stop()", p.ID, err)
+		p.Stop()
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		p.proxyLogger.Errorf("<%s> Sleep endpoint returned status %d, falling back to Stop()", p.ID, resp.StatusCode)
+		p.Stop()
+		return
+	}
+
+	// Transition to sleeping now that vLLM has confirmed sleep.
+	// Check state is still Ready — a concurrent Stop() may have changed it.
+	if p.CurrentState() != StateReady {
+		p.proxyLogger.Infof("<%s> State changed to %s during sleep POST, aborting sleep", p.ID, p.CurrentState())
+		return
+	}
+	if _, err := p.swapState(StateReady, StateSleeping); err != nil {
+		p.proxyLogger.Errorf("<%s> Sleep() state swap failed: %v, falling back to Stop()", p.ID, err)
+		p.Stop()
+		return
+	}
+
+	// Verify sleep via is_sleeping endpoint as a safety net.
+	verifyTimeout := time.Second * time.Duration(p.config.SleepWake.SleepVerifyTimeout)
+	if !p.verifySleepCompleted(verifyTimeout, 2*time.Second) {
+		if p.CurrentState() == StateStopped {
+			p.proxyLogger.Infof("<%s> Process exited during sleep verification, VRAM released", p.ID)
+			return
+		}
+		p.proxyLogger.Errorf("<%s> Sleep verification failed, falling back to Stop() to free VRAM", p.ID)
+		p.Stop()
+		return
+	}
+
+	p.proxyLogger.Infof("<%s> Model is now sleeping (verified)", p.ID)
+}
+
+// wake sends a POST to the wake endpoint and health-checks until ready.
+// Called internally by start() when the process is already in StateSleeping.
+func (p *Process) wake() error {
+	if _, err := p.swapState(StateSleeping, StateWaking); err != nil {
+		return fmt.Errorf("wake() failed to swap state: %v", err)
+	}
+
+	wakeURL, err := url.JoinPath(p.config.Proxy, p.config.SleepWake.WakeEndpoint)
+	if err != nil {
+		p.Stop()
+		return fmt.Errorf("failed to build wake URL: %v", err)
+	}
+
+	p.proxyLogger.Infof("<%s> Sending wake request to %s", p.ID, wakeURL)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post(wakeURL, "", nil)
+	if err != nil {
+		p.Stop()
+		return fmt.Errorf("wake request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		p.Stop()
+		return fmt.Errorf("wake endpoint returned status %d", resp.StatusCode)
+	}
+
+	// Health check loop with dedicated wake timeout
+	if checkEndpoint := strings.TrimSpace(p.config.CheckEndpoint); checkEndpoint != "none" {
+		healthURL, err := url.JoinPath(p.config.Proxy, checkEndpoint)
+		if err != nil {
+			p.Stop()
+			return fmt.Errorf("failed to create health check URL: %v", err)
+		}
+
+		maxDuration := time.Second * time.Duration(p.config.SleepWake.WakeVerifyTimeout)
+		checkStart := time.Now()
+		for {
+			if p.CurrentState() != StateWaking {
+				p.Stop()
+				return fmt.Errorf("wake interrupted, current state: %s", p.CurrentState())
+			}
+
+			if time.Since(checkStart) > maxDuration {
+				p.proxyLogger.Errorf("<%s> Wake health check timed out after %vs, stopping process", p.ID, maxDuration.Seconds())
+				p.Stop()
+				return fmt.Errorf("wake health check timed out after %vs", maxDuration.Seconds())
+			}
+
+			if err := p.checkHealthEndpoint(healthURL); err == nil {
+				p.proxyLogger.Infof("<%s> Wake health check passed on %s", p.ID, healthURL)
+				break
+			}
+
+			p.proxyLogger.Debugf("<%s> Wake health check pending on %s (normal during wake)", p.ID, healthURL)
+			<-time.After(p.healthCheckLoopInterval)
+		}
+	}
+
+	// start TTL goroutine if configured
+	if p.config.UnloadAfter > 0 {
+		go func() {
+			maxDuration := time.Duration(p.config.UnloadAfter) * time.Second
+			for range time.Tick(time.Second) {
+				if p.CurrentState() != StateReady {
+					return
+				}
+				if p.inFlightRequestsCount.Load() != 0 {
+					continue
+				}
+				if time.Since(p.getLastRequestHandled()) > maxDuration {
+					p.proxyLogger.Infof("<%s> Unloading model, TTL of %ds reached", p.ID, p.config.UnloadAfter)
+					if p.config.SleepWake.Enabled {
+						p.Sleep()
+					} else {
+						p.Stop()
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	if curState, err := p.swapState(StateWaking, StateReady); err != nil {
+		p.Stop()
+		return fmt.Errorf("failed to set Process state to ready after wake: current state: %v, error: %v", curState, err)
+	}
+
+	p.proxyLogger.Infof("<%s> Model is now awake", p.ID)
+	return nil
+}
+
+// IsSleeping queries the upstream is_sleeping endpoint to check if the model is sleeping.
+func (p *Process) IsSleeping() (bool, error) {
+	isSleepingURL, err := url.JoinPath(p.config.Proxy, p.config.SleepWake.IsSleepingEndpoint)
+	if err != nil {
+		return false, fmt.Errorf("failed to build is_sleeping URL: %v", err)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(isSleepingURL)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("is_sleeping endpoint returned status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		IsSleeping bool `json:"is_sleeping"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, fmt.Errorf("failed to decode is_sleeping response: %v", err)
+	}
+
+	return result.IsSleeping, nil
+}
+
+// verifySleepCompleted polls IsSleeping until it confirms the model is sleeping.
+// Returns true if sleep was verified, false if verification timed out or the
+// process left the sleeping state.
+func (p *Process) verifySleepCompleted(timeout, interval time.Duration) bool {
+	verifyStart := time.Now()
+	for {
+		sleeping, err := p.IsSleeping()
+		if err != nil {
+			if p.CurrentState() != StateSleeping {
+				p.proxyLogger.Infof("<%s> Process left sleeping state during verification: %s", p.ID, p.CurrentState())
+				return false
+			}
+			p.proxyLogger.Debugf("<%s> IsSleeping check error (will retry): %v", p.ID, err)
+		} else if sleeping {
+			p.proxyLogger.Infof("<%s> Sleep verified via IsSleeping endpoint (took %v)", p.ID, time.Since(verifyStart))
+			return true
+		}
+
+		if time.Since(verifyStart) > timeout {
+			p.proxyLogger.Errorf("<%s> Sleep verification timed out after %v", p.ID, timeout)
+			return false
+		}
+
+		<-time.After(interval)
+	}
 }
 
 // stopCommand will send a SIGTERM to the process and wait for it to exit.

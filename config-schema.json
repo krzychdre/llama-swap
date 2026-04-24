@@ -287,6 +287,36 @@
                     },
                     "timeouts": {
                         "$ref": "#/definitions/timeouts"
+                    },
+                    "sleepWake": {
+                        "type": "object",
+                        "properties": {
+                            "enabled": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Enable sleep/wake support for this model. Instead of stopping the process during swaps, sends sleep/wake requests to keep the process alive and reduce model switching time."
+                            },
+                            "sleepEndpoint": {
+                                "type": "string",
+                                "default": "/sleep",
+                                "pattern": "^/.*$",
+                                "description": "URL path to send a POST request to put the model to sleep (free VRAM). Relative to the model's proxy URL."
+                            },
+                            "wakeEndpoint": {
+                                "type": "string",
+                                "default": "/wake_up",
+                                "pattern": "^/.*$",
+                                "description": "URL path to send a POST request to wake the model (reload into VRAM). Relative to the model's proxy URL."
+                            },
+                            "isSleepingEndpoint": {
+                                "type": "string",
+                                "default": "/is_sleeping",
+                                "pattern": "^/.*$",
+                                "description": "URL path to send a GET request to check if the model is currently sleeping. Relative to the model's proxy URL."
+                            }
+                        },
+                        "additionalProperties": false,
+                        "description": "Sleep/wake configuration for vLLM models. Allows keeping the process alive while freeing VRAM during model swaps."
                     }
                 }
             }

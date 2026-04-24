@@ -172,6 +172,15 @@ groups:
 		IdleConn:       90,
 	}
 
+	defaultSleepWake := SleepWakeConfig{
+		Enabled:            false,
+		SleepEndpoint:      "/sleep",
+		WakeEndpoint:       "/wake_up",
+		IsSleepingEndpoint: "/is_sleeping",
+		SleepVerifyTimeout: 15,
+		WakeVerifyTimeout:  15,
+	}
+
 	expected := Config{
 		LogLevel:      "info",
 		LogTimeFormat: "",
@@ -197,6 +206,7 @@ groups:
 				Description:      "This is model 1",
 				SendLoadingState: &modelLoadingState,
 				Timeouts:         defaultTimeout,
+				SleepWake:        defaultSleepWake,
 			},
 			"model2": {
 				Cmd:              "path/to/server --arg1 one",
@@ -206,6 +216,7 @@ groups:
 				CheckEndpoint:    "/",
 				SendLoadingState: &modelLoadingState,
 				Timeouts:         defaultTimeout,
+				SleepWake:        defaultSleepWake,
 			},
 			"model3": {
 				Cmd:              "path/to/cmd --arg1 one",
@@ -215,6 +226,7 @@ groups:
 				CheckEndpoint:    "/",
 				SendLoadingState: &modelLoadingState,
 				Timeouts:         defaultTimeout,
+				SleepWake:        defaultSleepWake,
 			},
 			"model4": {
 				Cmd:              "path/to/cmd --arg1 one",
@@ -224,6 +236,7 @@ groups:
 				Env:              []string{},
 				SendLoadingState: &modelLoadingState,
 				Timeouts:         defaultTimeout,
+				SleepWake:        defaultSleepWake,
 			},
 		},
 		HealthCheckTimeout: 15,

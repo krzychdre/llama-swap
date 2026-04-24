@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { models, loadModel, unloadAllModels, unloadSingleModel } from "../stores/api";
+  import { models, loadModel, unloadAllModels, unloadSingleModel, sleepModel, wakeModel } from "../stores/api";
   import { isNarrow } from "../stores/theme";
   import { persistentStore } from "../stores/persistent";
   import type { Model } from "../lib/types";
@@ -152,6 +152,7 @@
         <tr class="text-left border-b border-gray-200 dark:border-white/10 bg-surface">
           <th>{$showIdorNameStore === "id" ? "Model ID" : "Name"}</th>
           <th></th>
+          <th></th>
           <th>State</th>
         </tr>
       </thead>
@@ -169,7 +170,16 @@
                 <p class="text-xs text-txtsecondary">Aliases: {model.aliases.join(", ")}</p>
               {/if}
             </td>
-            <td class="w-12">
+            <td class="w-16">
+              {#if model.sleepWakeEnabled && model.state === "ready"}
+                <button class="btn btn--sm" onclick={() => sleepModel(model.id)}>Sleep</button>
+              {:else if model.sleepWakeEnabled && model.state === "sleeping"}
+                <button class="btn btn--sm" onclick={() => wakeModel(model.id)}>Wake</button>
+              {:else if model.sleepWakeEnabled && model.state === "waking"}
+                <button class="btn btn--sm" disabled>...</button>
+              {/if}
+            </td>
+            <td class="w-16">
               {#if model.state === "stopped"}
                 <button class="btn btn--sm" onclick={() => loadModel(model.id)}>Load</button>
               {:else}
