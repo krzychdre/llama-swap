@@ -325,7 +325,7 @@ func (m *Matrix) ActiveModels() []string {
 func (m *Matrix) runningModels() []string {
 	var running []string
 	for id, process := range m.processes {
-		if process.CurrentState() == StateReady || process.CurrentState() == StateStarting || process.CurrentState() == StateWaking {
+		if process.CurrentState() == StateReady || process.CurrentState() == StateStarting || process.CurrentState() == StateWaking || process.CurrentState() == StateGoingToSleep {
 			running = append(running, id)
 		}
 	}

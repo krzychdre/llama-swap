@@ -53,6 +53,10 @@
   function getModelDisplay(model: Model): string {
     return $showIdorNameStore === "id" ? model.id : (model.name || model.id);
   }
+
+  function getStateLabel(state: Model["state"]): string {
+    return state === "going-to-sleep" ? "to sleep" : state;
+  }
 </script>
 
 <div class="card h-full flex flex-col">
@@ -175,7 +179,7 @@
                 <button class="btn btn--sm" onclick={() => sleepModel(model.id)}>Sleep</button>
               {:else if model.sleepWakeEnabled && model.state === "sleeping"}
                 <button class="btn btn--sm" onclick={() => wakeModel(model.id)}>Wake</button>
-              {:else if model.sleepWakeEnabled && model.state === "waking"}
+              {:else if model.sleepWakeEnabled && (model.state === "waking" || model.state === "going-to-sleep")}
                 <button class="btn btn--sm" disabled>...</button>
               {/if}
             </td>
@@ -187,7 +191,7 @@
               {/if}
             </td>
             <td class="w-20">
-              <span class="w-16 text-center status status--{model.state}">{model.state}</span>
+              <span class="w-16 text-center status status--{model.state}">{getStateLabel(model.state)}</span>
             </td>
           </tr>
         {/each}

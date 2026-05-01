@@ -81,6 +81,8 @@ func (pm *ProxyManager) getModelStatus() []Model {
 				state = "shutdown"
 			case StateStopped:
 				state = "stopped"
+			case StateGoingToSleep:
+				state = "going-to-sleep"
 			case StateSleeping:
 				state = "sleeping"
 			case StateWaking:

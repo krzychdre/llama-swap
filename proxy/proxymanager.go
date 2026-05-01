@@ -1114,7 +1114,7 @@ func (pm *ProxyManager) listRunningProcessesHandler(context *gin.Context) {
 	} else {
 		for _, processGroup := range pm.processGroups {
 			for _, process := range processGroup.processes {
-				if process.CurrentState() == StateReady || process.CurrentState() == StateSleeping || process.CurrentState() == StateWaking {
+				if process.CurrentState() == StateReady || process.CurrentState() == StateSleeping || process.CurrentState() == StateWaking || process.CurrentState() == StateGoingToSleep {
 					runningProcesses = append(runningProcesses, gin.H{
 						"model":       process.ID,
 						"state":       process.state,

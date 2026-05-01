@@ -151,6 +151,7 @@
     @apply bg-blue-500/10 text-blue-500;
   }
 
+  .status--going-to-sleep,
   .status--waking {
     @apply bg-warning/10 text-warning;
   }

@@ -24,12 +24,13 @@ import (
 type ProcessState string
 
 const (
-	StateStopped  ProcessState = ProcessState("stopped")
-	StateStarting ProcessState = ProcessState("starting")
-	StateReady    ProcessState = ProcessState("ready")
-	StateStopping ProcessState = ProcessState("stopping")
-	StateSleeping ProcessState = ProcessState("sleeping")
-	StateWaking   ProcessState = ProcessState("waking")
+	StateStopped      ProcessState = ProcessState("stopped")
+	StateStarting     ProcessState = ProcessState("starting")
+	StateReady        ProcessState = ProcessState("ready")
+	StateStopping     ProcessState = ProcessState("stopping")
+	StateGoingToSleep ProcessState = ProcessState("going-to-sleep")
+	StateSleeping     ProcessState = ProcessState("sleeping")
+	StateWaking       ProcessState = ProcessState("waking")
 
 	// process is shutdown and will not be restarted
 	StateShutdown ProcessState = ProcessState("shutdown")
@@ -66,6 +67,12 @@ type Process struct {
 
 	stateMutex sync.RWMutex
 	state      ProcessState
+
+	// serializes concurrent Sleep() calls; a second caller blocks until the
+	// first finishes, then observes the model already sleeping (or stopped)
+	// and returns. This both prevents double-POST races and gives swap callers
+	// a way to wait for an in-progress sleep before loading another model.
+	sleepMu sync.Mutex
 
 	inFlightRequests      sync.WaitGroup
 	inFlightRequestsCount atomic.Int32
@@ -212,11 +219,13 @@ func isValidTransition(from, to ProcessState) bool {
 	case StateStarting:
 		return to == StateReady || to == StateStopping || to == StateStopped
 	case StateReady:
-		return to == StateStopping || to == StateSleeping
+		return to == StateStopping || to == StateGoingToSleep
+	case StateGoingToSleep:
+		return to == StateSleeping || to == StateStopping
 	case StateSleeping:
 		return to == StateWaking || to == StateStopping
 	case StateWaking:
-		return to == StateReady || to == StateStopping || to == StateSleeping
+		return to == StateReady || to == StateStopping || to == StateGoingToSleep
 	case StateStopping:
 		return to == StateStopped || to == StateShutdown
 	case StateShutdown:
@@ -503,14 +512,46 @@ func (p *Process) IsSleepWakeEnabled() bool {
 // Sleep puts the model to sleep by sending a POST to the sleep endpoint.
 // This frees VRAM while keeping the process alive. Falls back to Stop() if
 // sleep is not enabled or fails.
+//
+// State flow: Ready → GoingToSleep (visible during the upstream POST, which
+// can take ~10s on large vLLM models) → Sleeping. The GoingToSleep state is
+// observable via the API/GUI and counts as VRAM-occupied for the matrix
+// solver, so other models cannot start loading concurrently.
+//
+// Concurrent Sleep() callers serialize on p.sleepMu: the second caller blocks
+// until the first finishes, then observes the model already sleeping and
+// returns. This makes Sleep() safe to call from a swap path while an explicit
+// user-triggered sleep is still in flight.
 func (p *Process) Sleep() {
 	if !p.config.SleepWake.Enabled {
 		p.Stop()
 		return
 	}
 
-	if !isValidTransition(p.CurrentState(), StateSleeping) {
-		p.proxyLogger.Debugf("<%s> Sleep() suppressing invalid transition from %s to StateSleeping", p.ID, p.CurrentState())
+	p.sleepMu.Lock()
+	defer p.sleepMu.Unlock()
+
+	switch curState := p.CurrentState(); curState {
+	case StateSleeping:
+		// already sleeping (likely a prior Sleep() finished while we waited
+		// on sleepMu) — nothing to do.
+		return
+	case StateReady:
+		// expected; proceed below.
+	default:
+		// StateStopped, StateStopping, StateStarting, StateWaking, etc.
+		// vLLM is not in a state where the sleep endpoint will work; fall
+		// back to Stop() which is a no-op for already-stopped states.
+		p.proxyLogger.Debugf("<%s> Sleep() falling back to Stop() from state %s", p.ID, curState)
+		p.Stop()
+		return
+	}
+
+	// Transition to GoingToSleep BEFORE the POST so the GUI immediately
+	// reflects the in-progress sleep and the matrix solver counts this model
+	// as VRAM-occupied.
+	if curState, err := p.swapState(StateReady, StateGoingToSleep); err != nil {
+		p.proxyLogger.Debugf("<%s> Sleep() state swap (Ready→GoingToSleep) failed (current=%s): %v", p.ID, curState, err)
 		return
 	}
 
@@ -525,8 +566,7 @@ func (p *Process) Sleep() {
 		return
 	}
 
-	// Send sleep request — vLLM blocks until VRAM is actually freed.
-	// Keep state as Ready during the POST so the GUI reflects reality.
+	// vLLM blocks this POST until VRAM is actually freed.
 	p.proxyLogger.Infof("<%s> Sending sleep request to %s", p.ID, sleepURL)
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Post(sleepURL, "", nil)
@@ -543,15 +583,11 @@ func (p *Process) Sleep() {
 		return
 	}
 
-	// Transition to sleeping now that vLLM has confirmed sleep.
-	// Check state is still Ready — a concurrent Stop() may have changed it.
-	if p.CurrentState() != StateReady {
-		p.proxyLogger.Infof("<%s> State changed to %s during sleep POST, aborting sleep", p.ID, p.CurrentState())
-		return
-	}
-	if _, err := p.swapState(StateReady, StateSleeping); err != nil {
-		p.proxyLogger.Errorf("<%s> Sleep() state swap failed: %v, falling back to Stop()", p.ID, err)
-		p.Stop()
+	// Transition to sleeping now that vLLM has confirmed sleep. A concurrent
+	// Stop() may have moved us into StateStopping/StateStopped; in that case
+	// the swap fails and we just bail out — Stop() will run to completion.
+	if curState, err := p.swapState(StateGoingToSleep, StateSleeping); err != nil {
+		p.proxyLogger.Infof("<%s> State changed to %s during sleep POST: %v", p.ID, curState, err)
 		return
 	}
 

@@ -1,6 +1,6 @@
 export type ConnectionState = "connected" | "connecting" | "disconnected";
 
-export type ModelStatus = "ready" | "starting" | "stopping" | "stopped" | "shutdown" | "sleeping" | "waking" | "unknown";
+export type ModelStatus = "ready" | "starting" | "stopping" | "stopped" | "shutdown" | "going-to-sleep" | "sleeping" | "waking" | "unknown";
 
 export interface Model {
   id: string;
