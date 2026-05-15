@@ -187,7 +187,7 @@
               {#if model.state === "stopped"}
                 <button class="btn btn--sm" onclick={() => loadModel(model.id)}>Load</button>
               {:else}
-                <button class="btn btn--sm" onclick={() => unloadSingleModel(model.id)} disabled={model.state !== "ready"}>Unload</button>
+                <button class="btn btn--sm" onclick={() => unloadSingleModel(model.id)} disabled={model.state !== "ready" && model.state !== "sleeping"}>Unload</button>
               {/if}
             </td>
             <td class="w-20">
