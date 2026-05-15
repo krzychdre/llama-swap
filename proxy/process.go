@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/event"
+	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/proxy/config"
 )
 
@@ -56,8 +57,8 @@ type Process struct {
 	// closed when command exits
 	cmdWaitChan chan struct{}
 
-	processLogger *LogMonitor
-	proxyLogger   *LogMonitor
+	processLogger *logmon.Monitor
+	proxyLogger   *logmon.Monitor
 
 	healthCheckTimeout      int
 	healthCheckLoopInterval time.Duration
@@ -93,7 +94,7 @@ type Process struct {
 	failedStartCount int
 }
 
-func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, processLogger *LogMonitor, proxyLogger *LogMonitor) *Process {
+func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, processLogger *logmon.Monitor, proxyLogger *logmon.Monitor) *Process {
 	concurrentLimit := 10
 	if config.ConcurrencyLimit > 0 {
 		concurrentLimit = config.ConcurrencyLimit
@@ -158,7 +159,7 @@ func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, pr
 }
 
 // LogMonitor returns the log monitor associated with the process.
-func (p *Process) LogMonitor() *LogMonitor {
+func (p *Process) LogMonitor() *logmon.Monitor {
 	return p.processLogger
 }
 
@@ -324,7 +325,7 @@ func (p *Process) start() error {
 					return fmt.Errorf("process was already starting but wound up in state %v", state)
 				}
 			} else {
-				return fmt.Errorf("processes was in state %v when start() was called", curState)
+				return fmt.Errorf("process was in state %v when start() was called", curState)
 			}
 		} else {
 			return fmt.Errorf("failed to set Process state to starting: current state: %v, error: %v", curState, err)
@@ -1000,7 +1001,7 @@ func (p *Process) cmdStopUpstreamProcess() error {
 }
 
 // Logger returns the logger for this process.
-func (p *Process) Logger() *LogMonitor {
+func (p *Process) Logger() *logmon.Monitor {
 	return p.processLogger
 }
 
