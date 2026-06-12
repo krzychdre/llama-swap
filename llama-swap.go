@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,6 +20,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/perf"
+	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/server"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 	"github.com/mostlygeek/llama-swap/internal/watcher"
@@ -121,6 +123,13 @@ func main() {
 
 	applyLogSettings(cfg)
 	proxyLog.Debugf("PID: %d", os.Getpid())
+
+	// On Windows, bind the process tree to a Job Object so every upstream
+	// process is reaped when llama-swap exits — even on a forced kill. No-op
+	// elsewhere. Non-fatal: a failure just falls back to per-process teardown.
+	if err := process.SetupTreeCleanup(); err != nil {
+		proxyLog.Warnf("failed to set up process tree cleanup: %v", err)
+	}
 
 	// perfMon outlives config reloads; its config is updated in place.
 	var perfMon *perf.Monitor
@@ -254,6 +263,11 @@ func main() {
 		}
 	}()
 
+	if !shared.IsLoopbackAddr(listenAddr) {
+		_, port, _ := net.SplitHostPort(listenAddr)
+		proxyLog.Infof("llama-swap is reachable by all hosts on the network, use -listen localhost:%s to restrict to loopback only", port)
+	}
+
 	exitChan := make(chan struct{})
 
 	go func() {
@@ -267,6 +281,16 @@ func main() {
 				proxyLog.Infof("received signal %v, shutting down", sig)
 				watcherCancel()
 
+				// Backstop against a stalled shutdown: force the process to
+				// exit once the whole graceful sequence has had its full budget.
+				// On Windows the Job Object reaps upstream processes on exit, so
+				// a forced exit still cleans up rather than orphaning children.
+				go func() {
+					time.Sleep(shutdownTimeout + 5*time.Second)
+					proxyLog.Warnf("graceful shutdown exceeded %v, forcing exit", shutdownTimeout)
+					os.Exit(1)
+				}()
+
 				activeMu.RLock()
 				srv := activeSrv
 				activeMu.RUnlock()
@@ -275,13 +299,23 @@ func main() {
 				// drain without blocking on them for the full timeout.
 				srv.CloseStreams()
 
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+				// Both phases share a single deadline so total shutdown is
+				// bounded by shutdownTimeout rather than 2x it.
+				deadline := time.Now().Add(shutdownTimeout)
+				shutdownCtx, cancel := context.WithDeadline(context.Background(), deadline)
 				defer cancel()
 				if err := httpServer.Shutdown(shutdownCtx); err != nil {
 					proxyLog.Warnf("http server shutdown error: %v", err)
 				}
 
-				if err := srv.Shutdown(shutdownTimeout); err != nil {
+				// Clamp the remaining budget to a small positive value: a
+				// non-positive timeout makes the router fall back to its own
+				// healthCheckTimeout, which would defeat the shared deadline.
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					remaining = time.Millisecond
+				}
+				if err := srv.Shutdown(remaining); err != nil {
 					proxyLog.Warnf("router shutdown error: %v", err)
 				}
 
