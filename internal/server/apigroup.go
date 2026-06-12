@@ -12,19 +12,21 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/perf"
+	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
 // apiModel is one entry in the /api/events modelStatus payload.
 type apiModel struct {
-	Id          string   `json:"id"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	State       string   `json:"state"`
-	Unlisted    bool     `json:"unlisted"`
-	PeerID      string   `json:"peerID"`
-	Aliases     []string `json:"aliases,omitempty"`
+	Id               string   `json:"id"`
+	Name             string   `json:"name"`
+	Description      string   `json:"description"`
+	State            string   `json:"state"`
+	Unlisted         bool     `json:"unlisted"`
+	PeerID           string   `json:"peerID"`
+	Aliases          []string `json:"aliases,omitempty"`
+	SleepWakeEnabled bool     `json:"sleepWakeEnabled,omitempty"`
 }
 
 // modelStatus returns every configured model joined with its current process
@@ -46,12 +48,13 @@ func (s *Server) modelStatus() []apiModel {
 			state = string(st)
 		}
 		models = append(models, apiModel{
-			Id:          id,
-			Name:        mc.Name,
-			Description: mc.Description,
-			State:       state,
-			Unlisted:    mc.Unlisted,
-			Aliases:     mc.Aliases,
+			Id:               id,
+			Name:             mc.Name,
+			Description:      mc.Description,
+			State:            state,
+			Unlisted:         mc.Unlisted,
+			Aliases:          mc.Aliases,
+			SleepWakeEnabled: mc.SleepWake.Enabled,
 		})
 	}
 
@@ -86,6 +89,74 @@ func (s *Server) handleAPIUnloadModel(w http.ResponseWriter, r *http.Request) {
 	s.local.Unload(apiUnloadTimeout, realName)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
+}
+
+// handleAPISleepModel puts a single sleep/wake-capable model to sleep, freeing
+// its VRAM while keeping the subprocess alive. Returns immediately; the sleep
+// proceeds in the background.
+func (s *Server) handleAPISleepModel(w http.ResponseWriter, r *http.Request) {
+	realName, ok := s.resolveSleepWakeModel(w, r)
+	if !ok {
+		return
+	}
+	s.local.SleepModel(realName)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+// handleAPIWakeModel wakes a sleeping model, evicting competing models the same
+// way a normal request would. It is a no-op if the model is not currently
+// sleeping. Returns immediately; the wake proceeds in the background.
+func (s *Server) handleAPIWakeModel(w http.ResponseWriter, r *http.Request) {
+	realName, ok := s.resolveSleepWakeModel(w, r)
+	if !ok {
+		return
+	}
+	if st, running := s.local.RunningModels()[realName]; !running || st != process.StateSleeping {
+		// Nothing to wake (already awake, stopped, or transitioning).
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+		return
+	}
+	s.wakeModel(realName)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+// resolveSleepWakeModel validates that the requested model is a local model
+// with sleep/wake enabled, writing the appropriate error response and
+// returning ok=false otherwise.
+func (s *Server) resolveSleepWakeModel(w http.ResponseWriter, r *http.Request) (string, bool) {
+	requested := strings.TrimPrefix(r.PathValue("model"), "/")
+	realName, found := s.cfg.RealModelName(requested)
+	if !found {
+		router.SendResponse(w, r, http.StatusNotFound, "model not found")
+		return "", false
+	}
+	if !s.local.Handles(realName) {
+		router.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+		return "", false
+	}
+	if !s.cfg.Models[realName].SleepWake.Enabled {
+		router.SendResponse(w, r, http.StatusBadRequest, "model does not support sleep/wake")
+		return "", false
+	}
+	return realName, true
+}
+
+// wakeModel triggers a background load of a sleeping model through the normal
+// request path so the scheduler evicts competing models and wakes it. The GET
+// response is discarded; the model is ready by the time the swap completes.
+func (s *Server) wakeModel(modelID string) {
+	go func() {
+		req, err := http.NewRequestWithContext(s.shutdownCtx, http.MethodGet, "/", nil)
+		if err != nil {
+			return
+		}
+		req = req.WithContext(router.SetContext(req.Context(), router.ReqContextData{Model: modelID, ModelID: modelID}))
+		dw := &discardResponseWriter{status: http.StatusOK}
+		s.local.ServeHTTP(dw, req)
+	}()
 }
 
 // handleAPIMetrics serves the activity log as a JSON array.

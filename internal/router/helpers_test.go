@@ -58,6 +58,8 @@ type fakeProcess struct {
 	runCalls   atomic.Int32
 	stopCalls  atomic.Int32
 	serveCalls atomic.Int32
+	sleepCalls atomic.Int32
+	wakeCalls  atomic.Int32
 
 	// inFlightServe counts ServeHTTP calls currently inside the handler.
 	// stoppedWhileServing flips true if Stop is ever called while that
@@ -154,6 +156,25 @@ func (f *fakeProcess) Stop(_ time.Duration) error {
 	default:
 		close(f.stopCh)
 	}
+	return nil
+}
+
+// Sleep mimics a sleep/wake-capable upstream freeing its VRAM: a ready process
+// transitions to sleeping while staying "alive" for a later Wake.
+func (f *fakeProcess) Sleep(_ time.Duration) error {
+	f.sleepCalls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.state == process.StateReady {
+		f.state = process.StateSleeping
+	}
+	return nil
+}
+
+// Wake brings a sleeping fake process back to ready.
+func (f *fakeProcess) Wake(_ time.Duration) error {
+	f.wakeCalls.Add(1)
+	f.setState(process.StateReady)
 	return nil
 }
 

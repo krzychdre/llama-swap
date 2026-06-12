@@ -310,7 +310,13 @@ func (s *FIFO) runningSet(excludeActive string) []string {
 		seen[id] = struct{}{}
 		out = append(out, id)
 	}
-	for id := range s.effects.RunningModels() {
+	for id, st := range s.effects.RunningModels() {
+		// A sleeping model has released its VRAM, so it does not occupy a slot
+		// for eviction planning — exclude it. Models that are going-to-sleep or
+		// waking still hold VRAM and must be counted.
+		if st == process.StateSleeping {
+			continue
+		}
 		add(id)
 	}
 	for _, id := range activeTargets(s.active, excludeActive) {

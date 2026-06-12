@@ -67,6 +67,12 @@ type LocalRouter interface {
 	// named. It blocks until each targeted process has stopped.
 	Unload(timeout time.Duration, models ...string)
 
+	// SleepModel puts a single sleep/wake-capable model to sleep, freeing its
+	// VRAM while keeping the subprocess alive. It returns immediately; the
+	// sleep proceeds in the background. Models without sleep/wake support are
+	// left untouched.
+	SleepModel(modelID string)
+
 	// ProcessLogger returns the log monitor for the named model's process.
 	// modelID must be a real (non-alias) config key. Returns false when the
 	// model is not known to this router.

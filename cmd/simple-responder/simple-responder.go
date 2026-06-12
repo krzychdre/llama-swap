@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -267,6 +268,21 @@ func main() {
 	r.GET("/health", func(c *gin.Context) {
 		c.Header("Content-Type", "application/json")
 		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	// Sleep/wake endpoints (vLLM compatibility) used by sleep/wake tests.
+	// A stateful flag tracks whether the model is "sleeping".
+	var sleeping atomic.Bool
+	r.POST("/sleep", func(c *gin.Context) {
+		sleeping.Store(true)
+		c.JSON(http.StatusOK, gin.H{"status": "sleeping"})
+	})
+	r.POST("/wake_up", func(c *gin.Context) {
+		sleeping.Store(false)
+		c.JSON(http.StatusOK, gin.H{"status": "awake"})
+	})
+	r.GET("/is_sleeping", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"is_sleeping": sleeping.Load()})
 	})
 
 	r.GET("/", func(c *gin.Context) {

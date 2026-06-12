@@ -235,23 +235,15 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	var wg sync.WaitGroup
 	for _, mID := range toStop {
 		wg.Add(1)
-		go func(p process.Process, id string) {
+		go func(id string) {
 			defer wg.Done()
-			if err := p.Stop(timeout); err != nil {
-				b.logger.Warnf("%s: stopping %s failed: %v", b.name, id, err)
-			}
-		}(b.processes[mID], mID)
+			b.evict(id, timeout)
+		}(mID)
 	}
 	wg.Wait()
 
 	target := b.processes[modelID]
-	if target.State() == process.StateStopped {
-		go func() {
-			if err := target.Run(timeout); err != nil {
-				b.logger.Warnf("%s: running %s exited: %v", b.name, modelID, err)
-			}
-		}()
-	}
+	b.startTarget(modelID, timeout)
 
 	err := target.WaitReady(b.shutdownCtx)
 
@@ -259,6 +251,82 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	case b.swapDoneCh <- scheduler.SwapDone{ModelID: modelID, Err: err}:
 	case <-b.shutdownCtx.Done():
 	}
+}
+
+// evict frees the VRAM held by a model so another can load. When the model
+// supports sleep/wake it is put to sleep — keeping the subprocess warm for a
+// fast wake — otherwise it is fully stopped. Blocks until the VRAM is freed.
+func (b *baseRouter) evict(id string, timeout time.Duration) {
+	p, ok := b.processes[id]
+	if !ok {
+		return
+	}
+	if b.config.Models[id].SleepWake.Enabled {
+		if err := p.Sleep(timeout); err != nil {
+			b.logger.Warnf("%s: sleeping %s failed: %v", b.name, id, err)
+		}
+		return
+	}
+	if err := p.Stop(timeout); err != nil {
+		b.logger.Warnf("%s: stopping %s failed: %v", b.name, id, err)
+	}
+}
+
+// startTarget brings modelID toward ready after its evictions are done: a
+// stopped process is started fresh, a sleeping one is woken. A still-settling
+// sleep/stop is waited out first so we dispatch on a stable state. WaitReady
+// (called by doSwap) remains the actual readiness gate.
+func (b *baseRouter) startTarget(modelID string, timeout time.Duration) {
+	target := b.processes[modelID]
+	for {
+		switch target.State() {
+		case process.StateStopped:
+			go func() {
+				if err := target.Run(timeout); err != nil {
+					b.logger.Warnf("%s: running %s exited: %v", b.name, modelID, err)
+				}
+			}()
+			return
+		case process.StateSleeping:
+			go func() {
+				if err := target.Wake(timeout); err != nil {
+					b.logger.Warnf("%s: waking %s failed: %v", b.name, modelID, err)
+				}
+			}()
+			return
+		case process.StateGoingToSleep, process.StateStopping:
+			// Transient: an in-progress sleep/stop is settling. Wait for it to
+			// reach a stable state, then dispatch on the next iteration.
+			select {
+			case <-time.After(50 * time.Millisecond):
+			case <-b.shutdownCtx.Done():
+				return
+			}
+		default:
+			// StateReady / StateStarting / StateWaking: already heading to or at
+			// ready; WaitReady handles it.
+			return
+		}
+	}
+}
+
+// SleepModel puts a single model to sleep, freeing its VRAM while keeping the
+// subprocess alive for a fast wake. It is asynchronous: the sleep (which can
+// take several seconds on large models) proceeds in the background. A model
+// without sleep/wake support is left untouched.
+func (b *baseRouter) SleepModel(modelID string) {
+	p, ok := b.processes[modelID]
+	if !ok {
+		return
+	}
+	if !b.config.Models[modelID].SleepWake.Enabled {
+		return
+	}
+	go func() {
+		if err := p.Sleep(b.healthCheckTimeout()); err != nil {
+			b.logger.Warnf("%s: sleeping %s failed: %v", b.name, modelID, err)
+		}
+	}()
 }
 
 func (b *baseRouter) handleShutdown(req shutdownReq) {

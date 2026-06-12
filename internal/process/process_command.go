@@ -2,6 +2,7 @@ package process
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -51,6 +52,16 @@ type waitReadyReq struct {
 	respond chan error
 }
 
+type sleepReq struct {
+	timeout time.Duration
+	respond chan error
+}
+
+type wakeReq struct {
+	timeout time.Duration
+	respond chan error
+}
+
 type startResult struct {
 	cmd       *exec.Cmd
 	cmdDone   chan struct{}
@@ -75,6 +86,8 @@ type ProcessCommand struct {
 	runCh       chan runReq
 	stopCh      chan stopReq
 	waitReadyCh chan waitReadyReq
+	sleepCh     chan sleepReq
+	wakeCh      chan wakeReq
 
 	// current ProcessState. Written only by run(); read by State() via atomic load.
 	state atomic.Value
@@ -106,6 +119,8 @@ func New(
 		runCh:       make(chan runReq),
 		stopCh:      make(chan stopReq),
 		waitReadyCh: make(chan waitReadyReq),
+		sleepCh:     make(chan sleepReq),
+		wakeCh:      make(chan wakeReq),
 		waitDelay:   cmdWaitDelay,
 	}
 	p.state.Store(StateStopped)
@@ -266,26 +281,7 @@ func (p *ProcessCommand) run() {
 
 					// Start TTL goroutine if configured — self-terminates
 					// when state leaves StateReady.
-					if p.config.UnloadAfter > 0 {
-						ttlDuration := time.Duration(p.config.UnloadAfter) * time.Second
-						go func() {
-							ticker := time.NewTicker(time.Second)
-							defer ticker.Stop()
-							for range ticker.C {
-								if p.State() != StateReady {
-									return
-								}
-								if p.inflight.Load() != 0 {
-									continue
-								}
-								if time.Since(time.Unix(0, p.lastUse.Load())) > ttlDuration {
-									p.proxyLogger.Infof("<%s> Unloading model, TTL of %ds reached", p.id, p.config.UnloadAfter)
-									p.Stop(10 * time.Second)
-									return
-								}
-							}
-						}()
-					}
+					p.startTTLLoop()
 				} else {
 					setState(StateStopped)
 					notifyWaiters(res.err)
@@ -350,6 +346,147 @@ func (p *ProcessCommand) run() {
 			setState(StateStopped)
 			respondRun(nil)
 			stop.respond <- nil
+
+		// Sleep: free the upstream's VRAM without killing the subprocess. Only
+		// valid from StateReady; from any other state there is nothing to do
+		// (already sleeping/stopped, or a transient the caller can treat as
+		// "VRAM not occupied"), so we just acknowledge. The cmd/cmdDone/cmdCancel
+		// trio is intentionally retained while sleeping so the Stop and cmdDone
+		// cases above keep working — that is what lets a sleeping model be
+		// stopped (unloaded) or noticed if its subprocess dies.
+		case sleep := <-p.sleepCh:
+			if state != StateReady {
+				sleep.respond <- nil
+				continue
+			}
+			if !p.config.SleepWake.Enabled {
+				// No sleep support: fall back to a full stop so the eviction
+				// caller still frees VRAM.
+				setState(StateStopping)
+				p.killProcess(cmd, cmdCancel, cmdDone, sleep.timeout)
+				cmd, cmdDone, cmdCancel = nil, nil, nil
+				p.handler.Store(nil)
+				setState(StateStopped)
+				respondRun(nil)
+				sleep.respond <- nil
+				continue
+			}
+
+			// Visible during the (possibly ~10s) sleep POST; the model still
+			// holds VRAM here, so the scheduler keeps counting it.
+			setState(StateGoingToSleep)
+			sleepCtx, cancelSleep := context.WithCancel(context.Background())
+			sleepResultCh := make(chan error, 1)
+			go func() { sleepResultCh <- p.doSleep(sleepCtx) }()
+
+			select {
+			case err := <-sleepResultCh:
+				cancelSleep()
+				if err != nil {
+					// Sleep failed — fall back to a full stop so VRAM is freed.
+					p.proxyLogger.Errorf("<%s> sleep failed, stopping to free VRAM: %v", p.id, err)
+					setState(StateStopping)
+					p.killProcess(cmd, cmdCancel, cmdDone, sleep.timeout)
+					cmd, cmdDone, cmdCancel = nil, nil, nil
+					p.handler.Store(nil)
+					setState(StateStopped)
+					respondRun(nil)
+				} else {
+					setState(StateSleeping)
+					p.proxyLogger.Infof("<%s> Model is now sleeping", p.id)
+				}
+				sleep.respond <- nil
+
+			case stop := <-p.stopCh:
+				// Explicit stop arrived mid-sleep: abort the sleep and tear down.
+				cancelSleep()
+				<-sleepResultCh
+				setState(StateStopping)
+				p.killProcess(cmd, cmdCancel, cmdDone, stop.timeout)
+				cmd, cmdDone, cmdCancel = nil, nil, nil
+				p.handler.Store(nil)
+				setState(StateStopped)
+				respondRun(nil)
+				sleep.respond <- nil
+				stop.respond <- nil
+
+			case <-p.parentCtx.Done():
+				cancelSleep()
+				setState(StateShutdown)
+				<-sleepResultCh
+				if cmd != nil {
+					p.handler.Store(nil)
+					p.killProcess(cmd, cmdCancel, cmdDone, parentCancelGraceTimeout)
+					cmd, cmdDone, cmdCancel = nil, nil, nil
+				}
+				notifyWaiters(fmt.Errorf("[%s] shutdown", p.id))
+				respondRun(fmt.Errorf("[%s] shutdown", p.id))
+				sleep.respond <- fmt.Errorf("[%s] shutdown", p.id)
+				return
+			}
+
+		// Wake: restore a sleeping model to ready. Only valid from StateSleeping;
+		// anything else is a no-op (already awake, or never slept). The original
+		// Run caller stays parked across the whole sleep/wake cycle since the
+		// subprocess never terminated.
+		case wake := <-p.wakeCh:
+			if state != StateSleeping {
+				wake.respond <- nil
+				continue
+			}
+
+			setState(StateWaking)
+			wakeCtx, cancelWake := context.WithCancel(context.Background())
+			wakeResultCh := make(chan error, 1)
+			go func() { wakeResultCh <- p.doWake(wakeCtx, wake.timeout) }()
+
+			select {
+			case err := <-wakeResultCh:
+				cancelWake()
+				if err != nil {
+					p.proxyLogger.Errorf("<%s> wake failed, stopping: %v", p.id, err)
+					setState(StateStopping)
+					p.killProcess(cmd, cmdCancel, cmdDone, wake.timeout)
+					cmd, cmdDone, cmdCancel = nil, nil, nil
+					p.handler.Store(nil)
+					setState(StateStopped)
+					respondRun(fmt.Errorf("[%s] wake failed: %w", p.id, err))
+					notifyWaiters(err)
+				} else {
+					setState(StateReady)
+					notifyWaiters(nil)
+					p.startTTLLoop()
+					p.proxyLogger.Infof("<%s> Model is now awake", p.id)
+				}
+				wake.respond <- err
+
+			case stop := <-p.stopCh:
+				cancelWake()
+				<-wakeResultCh
+				setState(StateStopping)
+				p.killProcess(cmd, cmdCancel, cmdDone, stop.timeout)
+				cmd, cmdDone, cmdCancel = nil, nil, nil
+				p.handler.Store(nil)
+				setState(StateStopped)
+				respondRun(nil)
+				notifyWaiters(ErrStartAborted)
+				wake.respond <- ErrStartAborted
+				stop.respond <- nil
+
+			case <-p.parentCtx.Done():
+				cancelWake()
+				setState(StateShutdown)
+				<-wakeResultCh
+				if cmd != nil {
+					p.handler.Store(nil)
+					p.killProcess(cmd, cmdCancel, cmdDone, parentCancelGraceTimeout)
+					cmd, cmdDone, cmdCancel = nil, nil, nil
+				}
+				notifyWaiters(fmt.Errorf("[%s] shutdown", p.id))
+				respondRun(fmt.Errorf("[%s] shutdown", p.id))
+				wake.respond <- fmt.Errorf("[%s] shutdown", p.id)
+				return
+			}
 		}
 	}
 }
@@ -660,6 +797,224 @@ func (p *ProcessCommand) Stop(timeout time.Duration) error {
 		return fmt.Errorf("[%s] shutdown", p.id)
 	}
 	return <-req.respond
+}
+
+// Sleep frees the upstream's VRAM, keeping the subprocess alive for a fast
+// Wake. It funnels through run() (the single state owner) and blocks until the
+// model is sleeping or, on any failure / unsupported config, until it has been
+// fully stopped — either way VRAM is freed. Concurrent Sleep callers serialize
+// in run(); the second observes a non-Ready state and returns immediately.
+func (p *ProcessCommand) Sleep(timeout time.Duration) error {
+	req := sleepReq{timeout: timeout, respond: make(chan error, 1)}
+	select {
+	case p.sleepCh <- req:
+	case <-p.parentCtx.Done():
+		return fmt.Errorf("[%s] shutdown", p.id)
+	}
+	return <-req.respond
+}
+
+// Wake restores a sleeping model to ready. It blocks until the model is ready
+// or returns an error (after stopping the process) if waking fails. Calling it
+// on a process that is not sleeping is a no-op.
+func (p *ProcessCommand) Wake(timeout time.Duration) error {
+	req := wakeReq{timeout: timeout, respond: make(chan error, 1)}
+	select {
+	case p.wakeCh <- req:
+	case <-p.parentCtx.Done():
+		return fmt.Errorf("[%s] shutdown", p.id)
+	}
+	return <-req.respond
+}
+
+// startTTLLoop launches the idle-unload goroutine when UnloadAfter is
+// configured. It self-terminates when the process leaves StateReady. On TTL
+// expiry it sleeps the model when sleep/wake is enabled (freeing VRAM while
+// keeping the process warm) and otherwise stops it. Called on the initial
+// ready transition and again after each wake.
+func (p *ProcessCommand) startTTLLoop() {
+	if p.config.UnloadAfter <= 0 {
+		return
+	}
+	ttlDuration := time.Duration(p.config.UnloadAfter) * time.Second
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if p.State() != StateReady {
+				return
+			}
+			if p.inflight.Load() != 0 {
+				continue
+			}
+			if time.Since(time.Unix(0, p.lastUse.Load())) > ttlDuration {
+				if p.config.SleepWake.Enabled {
+					p.proxyLogger.Infof("<%s> Sleeping model, TTL of %ds reached", p.id, p.config.UnloadAfter)
+					p.Sleep(10 * time.Second)
+				} else {
+					p.proxyLogger.Infof("<%s> Unloading model, TTL of %ds reached", p.id, p.config.UnloadAfter)
+					p.Stop(10 * time.Second)
+				}
+				return
+			}
+		}
+	}()
+}
+
+// doSleep waits for in-flight requests to drain, POSTs to the configured sleep
+// endpoint (vLLM blocks this until VRAM is actually freed), then verifies the
+// model reports itself sleeping. Runs in its own goroutine launched by run();
+// returns an error so the caller can fall back to a full stop.
+func (p *ProcessCommand) doSleep(ctx context.Context) error {
+	// Wait for in-flight requests to finish before freeing VRAM.
+	for p.inflight.Load() != 0 {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("sleep aborted")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	sleepURL, err := url.JoinPath(p.config.Proxy, p.config.SleepWake.SleepEndpoint)
+	if err != nil {
+		return fmt.Errorf("failed to build sleep URL: %w", err)
+	}
+
+	p.proxyLogger.Infof("<%s> Sending sleep request to %s", p.id, sleepURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, sleepURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to build sleep request: %w", err)
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("sleep request failed: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("sleep endpoint returned status %d", resp.StatusCode)
+	}
+
+	// Verify the model is actually sleeping as a safety net.
+	verifyTimeout := time.Second * time.Duration(p.config.SleepWake.SleepVerifyTimeout)
+	if !p.verifySleeping(ctx, verifyTimeout, 2*time.Second) {
+		return fmt.Errorf("sleep verification failed")
+	}
+	return nil
+}
+
+// doWake POSTs to the configured wake endpoint and health-checks the upstream
+// until it is ready (bounded by WakeVerifyTimeout). Runs in its own goroutine
+// launched by run().
+func (p *ProcessCommand) doWake(ctx context.Context, _ time.Duration) error {
+	wakeURL, err := url.JoinPath(p.config.Proxy, p.config.SleepWake.WakeEndpoint)
+	if err != nil {
+		return fmt.Errorf("failed to build wake URL: %w", err)
+	}
+
+	p.proxyLogger.Infof("<%s> Sending wake request to %s", p.id, wakeURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, wakeURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to build wake request: %w", err)
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("wake request failed: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("wake endpoint returned status %d", resp.StatusCode)
+	}
+
+	checkEndpoint := strings.TrimSpace(p.config.CheckEndpoint)
+	if checkEndpoint == "none" {
+		return nil
+	}
+
+	healthURL, err := url.JoinPath(p.config.Proxy, checkEndpoint)
+	if err != nil {
+		return fmt.Errorf("failed to build health check URL: %w", err)
+	}
+
+	deadline := time.Now().Add(time.Second * time.Duration(p.config.SleepWake.WakeVerifyTimeout))
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wake aborted")
+		default:
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("wake health check timed out")
+		}
+		hreq, _ := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+		hresp, herr := client.Do(hreq)
+		if herr == nil {
+			status := hresp.StatusCode
+			hresp.Body.Close()
+			if status == http.StatusOK {
+				p.proxyLogger.Infof("<%s> Wake health check passed on %s", p.id, healthURL)
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wake aborted")
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// verifySleeping polls the is_sleeping endpoint until it confirms the model is
+// sleeping, the timeout elapses, or ctx is cancelled.
+func (p *ProcessCommand) verifySleeping(ctx context.Context, timeout, interval time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		sleeping, err := p.isSleeping(ctx)
+		if err != nil {
+			p.proxyLogger.Debugf("<%s> is_sleeping check error (will retry): %v", p.id, err)
+		} else if sleeping {
+			p.proxyLogger.Infof("<%s> Sleep verified via is_sleeping endpoint", p.id)
+			return true
+		}
+		if time.Now().After(deadline) {
+			p.proxyLogger.Errorf("<%s> Sleep verification timed out after %v", p.id, timeout)
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(interval):
+		}
+	}
+}
+
+// isSleeping queries the upstream is_sleeping endpoint.
+func (p *ProcessCommand) isSleeping(ctx context.Context) (bool, error) {
+	isSleepingURL, err := url.JoinPath(p.config.Proxy, p.config.SleepWake.IsSleepingEndpoint)
+	if err != nil {
+		return false, fmt.Errorf("failed to build is_sleeping URL: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, isSleepingURL, nil)
+	if err != nil {
+		return false, err
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("is_sleeping endpoint returned status %d", resp.StatusCode)
+	}
+	var result struct {
+		IsSleeping bool `json:"is_sleeping"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, fmt.Errorf("failed to decode is_sleeping response: %w", err)
+	}
+	return result.IsSleeping, nil
 }
 
 func (p *ProcessCommand) State() ProcessState {

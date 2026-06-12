@@ -26,6 +26,9 @@ type stubRouter struct {
 	shutdownCalls atomic.Int32
 	running       map[string]process.ProcessState
 	unloadCalls   atomic.Int32
+	sleepCalls    atomic.Int32
+	sleepModel    string
+	serveCalls    atomic.Int32
 	loggers       map[string]*logmon.Monitor
 }
 
@@ -40,12 +43,14 @@ func newStubRouter(models []string, response string) *stubRouter {
 func (s *stubRouter) Handles(model string) bool      { return s.models[model] }
 func (s *stubRouter) Shutdown(_ time.Duration) error { s.shutdownCalls.Add(1); return nil }
 func (s *stubRouter) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	s.serveCalls.Add(1)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(s.response))
 }
 
 func (s *stubRouter) RunningModels() map[string]process.ProcessState { return s.running }
 func (s *stubRouter) Unload(_ time.Duration, _ ...string)            { s.unloadCalls.Add(1) }
+func (s *stubRouter) SleepModel(modelID string)                      { s.sleepCalls.Add(1); s.sleepModel = modelID }
 func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 	if s.loggers != nil {
 		if lg, ok := s.loggers[modelID]; ok {
