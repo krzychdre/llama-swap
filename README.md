@@ -1,4 +1,4 @@
-![llama-swap header image](docs/assets/hero3.webp)
+![llama-swap header image](docs/assets/hero4.webp)
 ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/mostlygeek/llama-swap/total)
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/mostlygeek/llama-swap/go-ci.yml)
 ![GitHub Repo stars](https://img.shields.io/github/stars/mostlygeek/llama-swap)
@@ -33,6 +33,7 @@ Built in Go for performance and simplicity, llama-swap has zero dependencies and
   - `v1/rerank`, `v1/reranking`, `/rerank`
   - `/infill` - for code infilling
   - `/completion` - for completion endpoint
+  - `/props` - requires `?model={model_id}` query parameter to be provided. The autoload parameter is not supported and will be ignored.
 - ✅ SDAPI via [stable-diffusion.cpp's server](https://github.com/leejet/stable-diffusion.cpp/tree/master/examples/server)
   - `/sdapi/v1/txt2img`
   - `/sdapi/v1/img2img`
@@ -65,33 +66,34 @@ Built in Go for performance and simplicity, llama-swap has zero dependencies and
 
 llama-swap includes a real time web interface with a playground for testing out all sorts of local models:
 
-<img width="1125" height="876" alt="image" src="https://github.com/user-attachments/assets/8ee41947-97af-463d-b0f0-8e9c478fac07" />
+<img width="1094" height="667" alt="image" src="https://github.com/user-attachments/assets/a79b3cea-5ee1-45f1-8db9-5f5331690e64" />
 
 View detailed token metrics:
 
-<img width="1111" height="515" alt="image" src="https://github.com/user-attachments/assets/64bfb280-d7a3-4126-971a-a128fd40410c" />
+<img width="1090" height="672" alt="image" src="https://github.com/user-attachments/assets/145f4ece-af2f-4a45-a3c1-45ae5d3c7e7f" />
 
 Inspect request and responses:
 
-<img width="1111" height="720" alt="image" src="https://github.com/user-attachments/assets/24fe4aca-1448-4d7c-b9e8-a967589bda6c" />
+<img width="1078" height="668" alt="image" src="https://github.com/user-attachments/assets/947cda4f-9aa1-4fa5-a550-5c469968c1d9" />
 
 Manually load and unload models:
 
-<img width="1109" height="719" alt="image" src="https://github.com/user-attachments/assets/02b1e1f2-abd0-4050-84ae-facd66ff01c4" />
+<img width="1088" height="659" alt="image" src="https://github.com/user-attachments/assets/b6b850f3-c5b0-4c14-ba90-be2de25b51c7" />
 
 Real time log streaming:
 
-<img width="1107" height="559" alt="image" src="https://github.com/user-attachments/assets/39669a10-cff2-409e-836a-5bad8bd0140c" />
+<img width="1087" height="668" alt="image" src="https://github.com/user-attachments/assets/9bb0c362-862c-4e68-820c-4c977fc9de4e" />
 
 ## Installation
 
 llama-swap can be installed in multiple ways
 
 1. Docker
-2. Homebrew (OSX and Linux)
-3. WinGet
-4. From release binaries
-5. From source
+2. Homebrew (macOS and Linux)
+3. MacPorts (macOS)
+4. WinGet
+5. From release binaries
+6. From source
 
 ### Docker Install ([download images](https://github.com/mostlygeek/llama-swap/pkgs/container/llama-swap))
 
@@ -152,6 +154,16 @@ docker pull ghcr.io/mostlygeek/llama-swap:cuda-non-root
 ```shell
 brew tap mostlygeek/llama-swap
 brew install llama-swap
+llama-swap --config path/to/config.yaml --listen localhost:8080
+```
+
+### MacPorts (macOS)
+
+> [!NOTE]
+> Maintained by MacPorts community - [llama-swap port](https://ports.macports.org/port/llama-swap). It is not an official part of llama-swap.
+
+```shell
+sudo port install llama-swap
 llama-swap --config path/to/config.yaml --listen localhost:8080
 ```
 

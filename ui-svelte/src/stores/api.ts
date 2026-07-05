@@ -1,4 +1,4 @@
-import { writable } from "svelte/store";
+import { writable, derived } from "svelte/store";
 import type {
   Model,
   ActivityLogEntry,
@@ -7,6 +7,7 @@ import type {
   APIEventEnvelope,
   ReqRespCapture,
   InFlightStats,
+  InflightRequestEntry,
   PerformanceResponse,
 } from "../lib/types";
 import { connectionState } from "./theme";
@@ -15,10 +16,15 @@ const LOG_LENGTH_LIMIT = 1024 * 100; /* 100KB of log data */
 
 // Stores
 export const models = writable<Model[]>([]);
+
+// True when at least one listed (non-unlisted) model is configured.
+export const hasListedModels = derived(models, ($models) => $models.some((m) => !m.unlisted));
 export const proxyLogs = writable<string>("");
 export const upstreamLogs = writable<string>("");
 export const metrics = writable<ActivityLogEntry[]>([]);
 export const inFlightRequests = writable<number>(0);
+export const inflightRequestEntries = writable<InflightRequestEntry[]>([]);
+export const performanceEnabled = writable<boolean>(false);
 export const versionInfo = writable<VersionInfo>({
   build_date: "unknown",
   commit: "unknown",
@@ -40,6 +46,7 @@ export function enableAPIEvents(enabled: boolean): void {
     apiEventSource = null;
     metrics.set([]);
     inFlightRequests.set(0);
+    inflightRequestEntries.set([]);
     return;
   }
 
@@ -58,6 +65,7 @@ export function enableAPIEvents(enabled: boolean): void {
       upstreamLogs.set("");
       metrics.set([]);
       inFlightRequests.set(0);
+      inflightRequestEntries.set([]);
       models.set([]);
       retryCount = 0;
       connectionState.set("connected");
@@ -65,42 +73,7 @@ export function enableAPIEvents(enabled: boolean): void {
 
     apiEventSource.onmessage = (e: MessageEvent) => {
       try {
-        const message = JSON.parse(e.data) as APIEventEnvelope;
-        switch (message.type) {
-          case "modelStatus": {
-            const newModels = JSON.parse(message.data) as Model[];
-            // Sort models by name and id
-            newModels.sort((a, b) => {
-              return (a.name + a.id).localeCompare(b.name + b.id, undefined, { numeric: true });
-            });
-            models.set(newModels);
-            break;
-          }
-
-          case "logData": {
-            const logData = JSON.parse(message.data) as LogData;
-            switch (logData.source) {
-              case "proxy":
-                appendLog(logData.data, proxyLogs);
-                break;
-              case "upstream":
-                appendLog(logData.data, upstreamLogs);
-                break;
-            }
-            break;
-          }
-
-          case "metrics": {
-            const newMetrics = JSON.parse(message.data) as ActivityLogEntry[];
-            metrics.update((prevMetrics) => [...newMetrics, ...prevMetrics]);
-            break;
-          }
-          case "inflight": {
-            const stats = JSON.parse(message.data) as InFlightStats;
-            inFlightRequests.set(stats.total ?? 0);
-            break;
-          }
-        }
+        handleAPIEventMessage(e.data);
       } catch (err) {
         console.error(e.data, err);
       }
@@ -116,6 +89,48 @@ export function enableAPIEvents(enabled: boolean): void {
   };
 
   connect();
+}
+
+export function handleAPIEventMessage(data: string): void {
+  const message = JSON.parse(data) as APIEventEnvelope;
+  switch (message.type) {
+    case "modelStatus": {
+      const newModels = JSON.parse(message.data) as Model[];
+      // Sort models by name and id
+      newModels.sort((a, b) => {
+        return (a.name + a.id).localeCompare(b.name + b.id, undefined, { numeric: true });
+      });
+      models.set(newModels);
+      break;
+    }
+
+    case "logData": {
+      const logData = JSON.parse(message.data) as LogData;
+      switch (logData.source) {
+        case "proxy":
+          appendLog(logData.data, proxyLogs);
+          break;
+        case "upstream":
+          appendLog(logData.data, upstreamLogs);
+          break;
+      }
+      break;
+    }
+
+    case "metrics": {
+      const newMetrics = JSON.parse(message.data) as ActivityLogEntry[];
+      metrics.update((prevMetrics) => [...newMetrics, ...prevMetrics]);
+      break;
+    }
+
+    case "inflight": {
+      const stats = JSON.parse(message.data) as InFlightStats;
+      const requests = stats.requests ?? [];
+      inFlightRequests.set(requests.length);
+      inflightRequestEntries.set(requests);
+      break;
+    }
+  }
 }
 
 // Fetch version info when connected
@@ -176,15 +191,33 @@ export async function unloadSingleModel(model: string): Promise<void> {
   }
 }
 
-export async function loadModel(model: string): Promise<void> {
+export async function cancelInflightRequest(id: string): Promise<void> {
   try {
-    const response = await fetch(`/upstream/${model}/`, {
+    const response = await fetch(`/api/inflight/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to cancel request: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to cancel inflight request", id, error);
+    throw error;
+  }
+}
+
+export async function loadModel(model: string, signal?: AbortSignal): Promise<void> {
+  try {
+    const response = await fetch(`/upstream/${model}/?_=${Date.now()}`, {
       method: "GET",
+      signal,
     });
     if (!response.ok) {
       throw new Error(`Failed to load model: ${response.status}`);
     }
   } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return;
+    }
     console.error("Failed to load model:", error);
     throw error;
   }
@@ -203,6 +236,20 @@ export async function getCapture(id: number): Promise<ReqRespCapture | null> {
   } catch (error) {
     console.error("Failed to fetch capture:", error);
     return null;
+  }
+}
+
+export async function checkPerformanceEnabled(): Promise<void> {
+  try {
+    const response = await fetch("/api/performance");
+    if (!response.ok) {
+      performanceEnabled.set(false);
+      return;
+    }
+    const data = await response.json();
+    performanceEnabled.set(data.enabled);
+  } catch {
+    performanceEnabled.set(false);
   }
 }
 

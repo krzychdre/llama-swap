@@ -12,19 +12,19 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/perf"
-	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
 // apiModel is one entry in the /api/events modelStatus payload.
 type apiModel struct {
-	Id          string   `json:"id"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	State       string   `json:"state"`
-	Unlisted    bool     `json:"unlisted"`
-	PeerID      string   `json:"peerID"`
-	Aliases     []string `json:"aliases,omitempty"`
+	Id           string         `json:"id"`
+	Name         string         `json:"name"`
+	Description  string         `json:"description"`
+	State        string         `json:"state"`
+	Unlisted     bool           `json:"unlisted"`
+	PeerID       string         `json:"peerID"`
+	Aliases      []string       `json:"aliases,omitempty"`
+	Capabilities map[string]any `json:"capabilities,omitempty"`
 }
 
 // modelStatus returns every configured model joined with its current process
@@ -45,13 +45,15 @@ func (s *Server) modelStatus() []apiModel {
 		if st, ok := running[id]; ok {
 			state = string(st)
 		}
+		_, capsMap, _, _ := renderCapabilities(mc.Capabilities)
 		models = append(models, apiModel{
-			Id:          id,
-			Name:        mc.Name,
-			Description: mc.Description,
-			State:       state,
-			Unlisted:    mc.Unlisted,
-			Aliases:     mc.Aliases,
+			Id:           id,
+			Name:         mc.Name,
+			Description:  mc.Description,
+			State:        state,
+			Unlisted:     mc.Unlisted,
+			Aliases:      mc.Aliases,
+			Capabilities: capsMap,
 		})
 	}
 
@@ -76,11 +78,11 @@ func (s *Server) handleAPIUnloadModel(w http.ResponseWriter, r *http.Request) {
 	requested := strings.TrimPrefix(r.PathValue("model"), "/")
 	realName, found := s.cfg.RealModelName(requested)
 	if !found {
-		router.SendResponse(w, r, http.StatusNotFound, "model not found")
+		shared.SendResponse(w, r, http.StatusNotFound, "model not found")
 		return
 	}
 	if !s.local.Handles(realName) {
-		router.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+		shared.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
 		return
 	}
 	s.local.Unload(apiUnloadTimeout, realName)
@@ -92,7 +94,7 @@ func (s *Server) handleAPIUnloadModel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAPIMetrics(w http.ResponseWriter, r *http.Request) {
 	data, err := s.metrics.getMetricsJSON()
 	if err != nil {
-		router.SendResponse(w, r, http.StatusInternalServerError, "failed to get metrics")
+		shared.SendResponse(w, r, http.StatusInternalServerError, "failed to get metrics")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -103,7 +105,9 @@ func (s *Server) handleAPIMetrics(w http.ResponseWriter, r *http.Request) {
 // filtered to samples after the ?after=<RFC3339> timestamp.
 func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 	if s.perf == nil {
-		router.SendResponse(w, r, http.StatusServiceUnavailable, "performance monitor not available")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]bool{"enabled": false})
 		return
 	}
 
@@ -112,7 +116,7 @@ func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 	if afterStr := r.URL.Query().Get("after"); afterStr != "" {
 		after, err := time.Parse(time.RFC3339, afterStr)
 		if err != nil {
-			router.SendResponse(w, r, http.StatusBadRequest, "invalid 'after' timestamp, use RFC3339 format")
+			shared.SendResponse(w, r, http.StatusBadRequest, "invalid 'after' timestamp, use RFC3339 format")
 			return
 		}
 		filteredSys := make([]perf.SysStat, 0, len(sysStats))
@@ -134,6 +138,7 @@ func (s *Server) handleAPIPerformance(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
+		"enabled":   true,
 		"sys_stats": sysStats,
 		"gpu_stats": gpuStats,
 	})
@@ -153,23 +158,36 @@ func (s *Server) handleAPIVersion(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAPICapture(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.Atoi(r.PathValue("id"))
 	if err != nil {
-		router.SendResponse(w, r, http.StatusBadRequest, "invalid capture ID")
+		shared.SendResponse(w, r, http.StatusBadRequest, "invalid capture ID")
 		return
 	}
 
 	capture := s.metrics.getCaptureByID(id)
 	if capture == nil {
-		router.SendResponse(w, r, http.StatusNotFound, "capture not found")
+		shared.SendResponse(w, r, http.StatusNotFound, "capture not found")
 		return
 	}
 
 	jsonBytes, err := json.Marshal(capture)
 	if err != nil {
-		router.SendResponse(w, r, http.StatusInternalServerError, "failed to marshal capture")
+		shared.SendResponse(w, r, http.StatusInternalServerError, "failed to marshal capture")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(jsonBytes)
+}
+
+// handleAPICancelInflight cancels an active model-dispatched request by its
+// inflight ID. Normal request cleanup removes the row and emits the update.
+func (s *Server) handleAPICancelInflight(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || !s.inflight.Cancel(id) {
+		shared.SendResponse(w, r, http.StatusNotFound, "inflight request not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"msg": "ok"})
 }
 
 type messageType string
@@ -198,7 +216,7 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		router.SendResponse(w, r, http.StatusInternalServerError, "streaming unsupported")
+		shared.SendResponse(w, r, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
 
@@ -232,8 +250,11 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			send(messageEnvelope{Type: msgTypeMetrics, Data: string(j)})
 		}
 	}
-	sendInFlight := func(total int) {
-		if j, err := json.Marshal(map[string]int{"total": total}); err == nil {
+	sendInFlight := func(stats shared.InFlightRequestsEvent) {
+		if stats.Requests == nil {
+			stats.Requests = []shared.InflightRequestEntry{}
+		}
+		if j, err := json.Marshal(stats); err == nil {
 			send(messageEnvelope{Type: msgTypeInFlight, Data: string(j)})
 		}
 	}
@@ -243,14 +264,14 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	defer s.proxylog.OnLogData(func(data []byte) { sendLogData("proxy", data) })()
 	defer s.upstreamlog.OnLogData(func(data []byte) { sendLogData("upstream", data) })()
 	defer event.On(func(e ActivityLogEvent) { sendMetrics([]ActivityLogEntry{e.Metrics}) })()
-	defer event.On(func(e shared.InFlightRequestsEvent) { sendInFlight(e.Total) })()
+	defer event.On(func(e shared.InFlightRequestsEvent) { sendInFlight(e) })()
 
 	// initial payload
 	sendLogData("proxy", s.proxylog.GetHistory())
 	sendLogData("upstream", s.upstreamlog.GetHistory())
 	sendModels()
 	sendMetrics(s.metrics.getMetrics())
-	sendInFlight(int(s.inflight.Current()))
+	sendInFlight(s.inflight.Current())
 
 	for {
 		select {
