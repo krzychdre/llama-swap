@@ -4,11 +4,38 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/router"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
+
+// ensureStreamUsage sets stream_options.include_usage on streaming completion
+// requests so OpenAI-compatible backends (e.g. vllm) emit a usage object in the
+// stream; without it they report no token counts at all. llama.cpp already
+// includes timings regardless, so this is harmless there. It leaves the body
+// untouched when it is not a streaming request or the client already set
+// stream_options. Returns the updated body and true only when a change was made.
+func ensureStreamUsage(body []byte) ([]byte, bool) {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return nil, false
+	}
+	if !gjson.GetBytes(body, "stream").Bool() {
+		return nil, false
+	}
+	if gjson.GetBytes(body, "stream_options.include_usage").Exists() {
+		return nil, false
+	}
+	updated, err := sjson.SetBytes(body, "stream_options.include_usage", true)
+	if err != nil {
+		return nil, false
+	}
+	return updated, true
+}
 
 // CreateMetricsMiddleware returns middleware that records token metrics for
 // model-dispatched POST requests. It resolves the model, tees the response into
@@ -30,21 +57,31 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 			}
 
 			// Buffer the request body/headers for capture before dispatch
-			// consumes them.
+			// consumes them. The body is also read when it is a JSON request so
+			// stream_options can be injected for streaming backends like vllm.
 			cf := captureFieldsFor(r.URL.Path)
+			isJSON := strings.Contains(r.Header.Get("Content-Type"), "application/json")
 			var reqBody []byte
 			var reqHeaders map[string]string
-			if mm.enableCaptures {
-				if cf&captureReqBody != 0 && r.Body != nil {
-					if buffered, err := io.ReadAll(r.Body); err == nil {
-						reqBody = buffered
-						r.Body.Close()
-						r.Body = io.NopCloser(bytes.NewReader(reqBody))
-					}
+			if r.Body != nil && (isJSON || (mm.enableCaptures && cf&captureReqBody != 0)) {
+				if buffered, err := io.ReadAll(r.Body); err == nil {
+					reqBody = buffered
+					r.Body.Close()
+					r.Body = io.NopCloser(bytes.NewReader(reqBody))
 				}
-				if cf&captureReqHeaders != 0 {
-					reqHeaders = headerMap(r.Header)
-					redactHeaders(reqHeaders)
+			}
+			if mm.enableCaptures && cf&captureReqHeaders != 0 {
+				reqHeaders = headerMap(r.Header)
+				redactHeaders(reqHeaders)
+			}
+
+			// Inject stream_options.include_usage so streaming backends report
+			// token usage. reqBody keeps the original body for capture.
+			if isJSON {
+				if injected, ok := ensureStreamUsage(reqBody); ok {
+					r.Body = io.NopCloser(bytes.NewReader(injected))
+					r.ContentLength = int64(len(injected))
+					r.Header.Set("Content-Length", strconv.Itoa(len(injected)))
 				}
 			}
 

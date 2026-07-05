@@ -164,7 +164,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	}
 
 	if strings.Contains(recorder.Header().Get("Content-Type"), "text/event-stream") {
-		if parsed, err := processStreamingResponse(modelID, recorder.StartTime(), body); err != nil {
+		if parsed, err := processStreamingResponse(modelID, recorder.StartTime(), recorder.FirstWrite(), recorder.LastWrite(), body); err != nil {
 			mp.logger.Warnf("error processing streaming response: %v, path=%s, recording minimal metrics", err, r.URL.Path)
 		} else {
 			tm.Tokens = parsed.Tokens
@@ -259,7 +259,7 @@ func extractUsageTokens(usage gjson.Result) (input, output, cached int64, ok boo
 	return
 }
 
-func processStreamingResponse(modelID string, start time.Time, body []byte) (ActivityLogEntry, error) {
+func processStreamingResponse(modelID string, start, firstToken, lastToken time.Time, body []byte) (ActivityLogEntry, error) {
 	var (
 		inputTokens, outputTokens int64
 		cachedTokens              int64 = -1
@@ -322,17 +322,22 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Act
 		return ActivityLogEntry{}, fmt.Errorf("no valid JSON data found in stream")
 	}
 
-	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, timings), nil
+	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, timings, firstToken, lastToken), nil
 }
 
 func parseMetrics(modelID string, start time.Time, usage, timings gjson.Result) (ActivityLogEntry, error) {
 	input, output, cached, _ := extractUsageTokens(usage)
-	return buildMetrics(modelID, start, input, output, cached, timings), nil
+	// Non-streaming responses have no per-token stream timing, so rates are only
+	// available when the backend supplies llama.cpp timings.
+	return buildMetrics(modelID, start, input, output, cached, timings, time.Time{}, time.Time{}), nil
 }
 
 // buildMetrics composes an ActivityLogEntry from accumulated token counts and
 // optional llama-server timings (which override input/output and provide rates).
-func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, timings gjson.Result) ActivityLogEntry {
+// For streaming backends that omit timings (e.g. vllm), firstToken/lastToken
+// bracket the generated stream so rates can be derived from the proxy's own
+// timing; they are zero for non-streaming responses.
+func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, timings gjson.Result, firstToken, lastToken time.Time) ActivityLogEntry {
 	wallDurationMs := int(time.Since(start).Milliseconds())
 	durationMs := wallDurationMs
 	tokensPerSecond := -1.0
@@ -349,6 +354,16 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 		}
 		if cachedValue := timings.Get("cache_n"); cachedValue.Exists() {
 			cachedTokens = cachedValue.Int()
+		}
+	} else if !firstToken.IsZero() && lastToken.After(firstToken) {
+		// Derive rates from stream timing: start..firstToken approximates prompt
+		// processing (queue + prefill); firstToken..lastToken brackets the
+		// generation of the remaining output tokens.
+		if genSecs := lastToken.Sub(firstToken).Seconds(); genSecs > 0 && outputTokens > 1 {
+			tokensPerSecond = float64(outputTokens-1) / genSecs
+		}
+		if ttftSecs := firstToken.Sub(start).Seconds(); ttftSecs > 0 && inputTokens > 0 {
+			promptPerSecond = float64(inputTokens) / ttftSecs
 		}
 	}
 
@@ -412,6 +427,8 @@ type responseBodyCopier struct {
 	status      int
 	wroteHeader bool
 	start       time.Time
+	firstWrite  time.Time
+	lastWrite   time.Time
 }
 
 func newBodyCopier(w http.ResponseWriter) *responseBodyCopier {
@@ -435,6 +452,13 @@ func (w *responseBodyCopier) Write(b []byte) (int, error) {
 	if w.status == http.StatusSwitchingProtocols {
 		return w.ResponseWriter.Write(b)
 	}
+	// Record write timing so streaming backends without llama.cpp timings can
+	// have generation rates derived from the stream itself.
+	now := time.Now()
+	if w.firstWrite.IsZero() {
+		w.firstWrite = now
+	}
+	w.lastWrite = now
 	return w.tee.Write(b)
 }
 
@@ -463,5 +487,7 @@ func (w *responseBodyCopier) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
 }
 
-func (w *responseBodyCopier) Status() int          { return w.status }
-func (w *responseBodyCopier) StartTime() time.Time { return w.start }
+func (w *responseBodyCopier) Status() int           { return w.status }
+func (w *responseBodyCopier) StartTime() time.Time  { return w.start }
+func (w *responseBodyCopier) FirstWrite() time.Time { return w.firstWrite }
+func (w *responseBodyCopier) LastWrite() time.Time  { return w.lastWrite }

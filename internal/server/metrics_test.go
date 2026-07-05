@@ -41,7 +41,7 @@ func TestServer_ProcessStreamingResponse(t *testing.T) {
 	body := []byte("data: {\"choices\":[{}]}\n\n" +
 		"data: {\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":33}}\n\n" +
 		"data: [DONE]\n\n")
-	entry, err := processStreamingResponse("m", time.Now(), body)
+	entry, err := processStreamingResponse("m", time.Now(), time.Time{}, time.Time{}, body)
 	if err != nil {
 		t.Fatalf("processStreamingResponse: %v", err)
 	}
@@ -51,8 +51,59 @@ func TestServer_ProcessStreamingResponse(t *testing.T) {
 }
 
 func TestServer_ProcessStreamingResponse_NoData(t *testing.T) {
-	if _, err := processStreamingResponse("m", time.Now(), []byte("data: [DONE]\n\n")); err == nil {
+	if _, err := processStreamingResponse("m", time.Now(), time.Time{}, time.Time{}, []byte("data: [DONE]\n\n")); err == nil {
 		t.Fatal("expected error for stream with no usage data")
+	}
+}
+
+// Streaming backends without llama.cpp timings (e.g. vllm) get generation rates
+// derived from the proxy's own stream write timing.
+func TestServer_ProcessStreamingResponse_DerivedRates(t *testing.T) {
+	body := []byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+		"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":11}}\n\n" +
+		"data: [DONE]\n\n")
+
+	start := time.Now()
+	firstToken := start.Add(500 * time.Millisecond) // TTFT: 100 prompt tokens / 0.5s = 200 t/s
+	lastToken := firstToken.Add(1 * time.Second)    // gen: (11-1) tokens / 1s = 10 t/s
+
+	entry, err := processStreamingResponse("m", start, firstToken, lastToken, body)
+	if err != nil {
+		t.Fatalf("processStreamingResponse: %v", err)
+	}
+	if entry.Tokens.InputTokens != 100 || entry.Tokens.OutputTokens != 11 {
+		t.Fatalf("tokens = %+v", entry.Tokens)
+	}
+	if entry.Tokens.TokensPerSecond != 10.0 {
+		t.Fatalf("TokensPerSecond = %v, want 10", entry.Tokens.TokensPerSecond)
+	}
+	if entry.Tokens.PromptPerSecond != 200.0 {
+		t.Fatalf("PromptPerSecond = %v, want 200", entry.Tokens.PromptPerSecond)
+	}
+}
+
+func TestServer_EnsureStreamUsage(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantMod bool
+	}{
+		{"streaming injects", `{"stream":true,"messages":[]}`, true},
+		{"non-streaming untouched", `{"stream":false}`, false},
+		{"no stream field untouched", `{"messages":[]}`, false},
+		{"already set untouched", `{"stream":true,"stream_options":{"include_usage":false}}`, false},
+		{"invalid json untouched", `not json`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, mod := ensureStreamUsage([]byte(tc.body))
+			if mod != tc.wantMod {
+				t.Fatalf("modified = %v, want %v", mod, tc.wantMod)
+			}
+			if mod && !gjson.GetBytes(out, "stream_options.include_usage").Bool() {
+				t.Fatalf("include_usage not set: %s", out)
+			}
+		})
 	}
 }
 
