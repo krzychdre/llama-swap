@@ -2,6 +2,16 @@ export type ConnectionState = "connected" | "connecting" | "disconnected";
 
 export type ModelStatus = "ready" | "starting" | "stopping" | "stopped" | "shutdown" | "going-to-sleep" | "sleeping" | "waking" | "unknown";
 
+export interface ModelCapabilities {
+  vision?: boolean;
+  audio_transcriptions?: boolean;
+  audio_speech?: boolean;
+  image_generation?: boolean;
+  image_to_image?: boolean;
+  function_calling?: boolean;
+  reranker?: boolean;
+}
+
 export interface Model {
   id: string;
   state: ModelStatus;
@@ -11,10 +21,13 @@ export interface Model {
   peerID: string;
   aliases?: string[];
   sleepWakeEnabled?: boolean;
+  capabilities?: ModelCapabilities;
 }
 
 export interface TokenMetrics {
   cache_tokens: number;
+  draft_tokens: number;
+  draft_acc_tokens: number;
   input_tokens: number;
   output_tokens: number;
   prompt_per_second: number;
@@ -31,6 +44,8 @@ export interface ActivityLogEntry {
   tokens: TokenMetrics;
   duration_ms: number;
   has_capture: boolean;
+  error_msg?: string;
+  metadata?: Record<string, string>;
 }
 
 export interface ReqRespCapture {
@@ -47,8 +62,17 @@ export interface LogData {
   data: string;
 }
 
+export interface InflightRequestEntry {
+  id: string;
+  timestamp: string;
+  model: string;
+  req_path: string;
+  method: string;
+  metadata?: Record<string, string>;
+}
+
 export interface InFlightStats {
-  total: number;
+  requests?: InflightRequestEntry[];
 }
 
 export interface NetIOStat {

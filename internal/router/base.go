@@ -12,6 +12,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
+	"github.com/mostlygeek/llama-swap/internal/shared"
 )
 
 type shutdownReq struct {
@@ -27,8 +28,7 @@ type unloadReq struct {
 
 // baseRouter owns the channels, run-loop, and process machinery shared by every
 // concrete router. Concrete routers embed *baseRouter and supply a
-// scheduler.Factory (which captures their scheduler.Swapper) describing how
-// requests are scheduled and how their eviction set is decided. baseRouter
+// scheduler.Swapper describing how eviction sets are decided. baseRouter
 // implements scheduler.Effects so the scheduler can call back for side-effects.
 type baseRouter struct {
 	name      string
@@ -53,6 +53,7 @@ type baseRouter struct {
 	procCancel context.CancelFunc
 
 	handlerCh   chan scheduler.HandlerReq
+	cancelCh    chan scheduler.HandlerReq
 	shutdownCh  chan shutdownReq
 	unloadCh    chan unloadReq
 	swapDoneCh  chan scheduler.SwapDone
@@ -73,8 +74,8 @@ func newBaseRouter(
 	conf config.Config,
 	processes map[string]process.Process,
 	logger *logmon.Monitor,
-	newSched scheduler.Factory,
-) *baseRouter {
+	planner scheduler.Swapper,
+) (*baseRouter, error) {
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	procCtx, procCancel := context.WithCancel(context.Background())
 	b := &baseRouter{
@@ -87,14 +88,19 @@ func newBaseRouter(
 		procCtx:     procCtx,
 		procCancel:  procCancel,
 		handlerCh:   make(chan scheduler.HandlerReq),
+		cancelCh:    make(chan scheduler.HandlerReq),
 		shutdownCh:  make(chan shutdownReq),
 		unloadCh:    make(chan unloadReq),
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
 		runDone:     make(chan struct{}),
 	}
-	b.schedule = newSched(name, logger, b)
-	return b
+	sched, err := scheduler.New(conf, name, logger, planner, b)
+	if err != nil {
+		return nil, err
+	}
+	b.schedule = sched
+	return b, nil
 }
 
 func (b *baseRouter) notifyProcessed() {
@@ -114,6 +120,10 @@ func (b *baseRouter) run() {
 
 		case req := <-b.handlerCh:
 			b.schedule.OnRequest(req)
+			b.notifyProcessed()
+
+		case req := <-b.cancelCh:
+			b.schedule.OnCancel(req)
 			b.notifyProcessed()
 
 		case req := <-b.unloadCh:
@@ -467,13 +477,13 @@ func (b *baseRouter) Shutdown(timeout time.Duration) error {
 
 func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if b.shuttingDown.Load() {
-		SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
+		shared.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
 		return
 	}
 
-	data, err := FetchContext(req, b.config)
+	data, err := shared.FetchContext(req, b.config)
 	if err != nil {
-		SendError(w, req, err)
+		shared.SendError(w, req, err)
 		return
 	}
 
@@ -483,6 +493,7 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// Unbuffered: a successful send on Respond proves the waiter is
 		// alive and consuming. grant() relies on this to avoid handing a
 		// handleFunc to a cancelled waiter and leaking the inFlight count.
+		Admit:      make(chan error, 1),
 		Respond:    make(chan scheduler.HandlerResp),
 		PositionCh: make(chan int, 1),
 	}
@@ -492,7 +503,25 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case <-req.Context().Done():
 		return
 	case <-b.shutdownCtx.Done():
-		SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
+		shared.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
+		return
+	}
+
+	var admissionErr error
+	select {
+	case admissionErr = <-hr.Admit:
+	case <-req.Context().Done():
+		select {
+		case b.cancelCh <- hr:
+		case <-b.shutdownCtx.Done():
+		}
+		return
+	case <-b.shutdownCtx.Done():
+		shared.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
+		return
+	}
+	if admissionErr != nil {
+		shared.SendError(w, req, admissionErr)
 		return
 	}
 
@@ -540,15 +569,23 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		finishLoading()
 	case <-req.Context().Done():
 		finishLoading()
+		// Notify the scheduler so it can prune this request from its queue
+		// and swap waiters. Without this, a queued request whose client left
+		// would sit in the scheduler until drainQueue eventually starts a
+		// wasted model load for it.
+		select {
+		case b.cancelCh <- hr:
+		case <-b.shutdownCtx.Done():
+		}
 		return
 	case <-b.shutdownCtx.Done():
 		finishLoading()
-		SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
+		shared.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
 		return
 	}
 
 	if resp.Err != nil {
-		SendError(w, req, resp.Err)
+		shared.SendError(w, req, resp.Err)
 		return
 	}
 	resp.HandleFunc(w, req)

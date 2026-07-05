@@ -7,5 +7,5 @@ dist/
 .dev/
 deploy.sh
 
-# UI build output; placeholder.txt is kept so the go:embed succeeds.
+# UI build output; embedded via the `embed_ui` build tag (internal/server/embed.go)
 internal/server/ui_dist/*
