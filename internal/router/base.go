@@ -475,6 +475,13 @@ func (b *baseRouter) Shutdown(timeout time.Duration) error {
 	return <-req.respond
 }
 
+// streamTimingResetter is implemented by the metrics middleware's response
+// writer. Resetting discards the write timing produced by loading-state SSE
+// chunks so derived token rates measure only the upstream response.
+type streamTimingResetter interface {
+	ResetStreamTiming()
+}
+
 func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if b.shuttingDown.Load() {
 		shared.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
@@ -567,6 +574,14 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	select {
 	case resp = <-hr.Respond:
 		finishLoading()
+		// The loading stream's chunks were recorded as response writes; drop
+		// that timing so the metrics layer derives token rates from the
+		// upstream's own first write instead of the loading banner.
+		if lw != nil {
+			if rt, ok := w.(streamTimingResetter); ok {
+				rt.ResetStreamTiming()
+			}
+		}
 	case <-req.Context().Done():
 		finishLoading()
 		// Notify the scheduler so it can prune this request from its queue

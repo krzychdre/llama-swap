@@ -48,6 +48,32 @@ export interface ActivityLogEntry {
   metadata?: Record<string, string>;
 }
 
+export interface MetricsPage {
+  entries: ActivityLogEntry[];
+  total: number;
+  has_more: boolean;
+}
+
+export interface MetricsQuery {
+  limit?: number;
+  before_id?: number;
+  from?: string; // RFC3339
+  to?: string; // RFC3339
+  model?: string;
+}
+
+export interface MetricsSummary {
+  requests: number;
+  errors: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  avg_prompt_per_second: number;
+  avg_tokens_per_second: number;
+  prompt_histogram: HistogramData | null;
+  gen_histogram: HistogramData | null;
+}
+
 export interface ReqRespCapture {
   id: number;
   req_path: string;

@@ -9,10 +9,17 @@ import type {
   InFlightStats,
   InflightRequestEntry,
   PerformanceResponse,
+  MetricsPage,
+  MetricsQuery,
+  MetricsSummary,
 } from "../lib/types";
 import { connectionState } from "./theme";
 
 const LOG_LENGTH_LIMIT = 1024 * 100; /* 100KB of log data */
+
+/* The metrics store only feeds live views with the most recent entries;
+ * history is paged from the server via fetchMetrics. */
+const METRICS_STORE_LIMIT = 100;
 
 // Stores
 export const models = writable<Model[]>([]);
@@ -119,7 +126,7 @@ export function handleAPIEventMessage(data: string): void {
 
     case "metrics": {
       const newMetrics = JSON.parse(message.data) as ActivityLogEntry[];
-      metrics.update((prevMetrics) => [...newMetrics, ...prevMetrics]);
+      metrics.update((prevMetrics) => [...newMetrics, ...prevMetrics].slice(0, METRICS_STORE_LIMIT));
       break;
     }
 
@@ -248,6 +255,43 @@ export async function loadModel(model: string, signal?: AbortSignal): Promise<vo
     }
     console.error("Failed to load model:", error);
     throw error;
+  }
+}
+
+function metricsQueryString(params: MetricsQuery): string {
+  const q = new URLSearchParams();
+  if (params.limit) q.set("limit", String(params.limit));
+  if (params.before_id) q.set("before_id", String(params.before_id));
+  if (params.from) q.set("from", params.from);
+  if (params.to) q.set("to", params.to);
+  if (params.model) q.set("model", params.model);
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+export async function fetchMetrics(params: MetricsQuery = {}): Promise<MetricsPage | null> {
+  try {
+    const response = await fetch(`/api/metrics${metricsQueryString(params)}`);
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Failed to fetch metrics:", error);
+    return null;
+  }
+}
+
+export async function fetchMetricsSummary(params: MetricsQuery = {}): Promise<MetricsSummary | null> {
+  try {
+    const response = await fetch(`/api/metrics/summary${metricsQueryString(params)}`);
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Failed to fetch metrics summary:", error);
+    return null;
   }
 }
 

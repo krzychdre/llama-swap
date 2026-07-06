@@ -105,17 +105,27 @@ type HookOnStartup struct {
 }
 
 type Config struct {
-	HealthCheckTimeout int                    `yaml:"healthCheckTimeout"`
-	LogRequests        bool                   `yaml:"logRequests"`
-	LogLevel           string                 `yaml:"logLevel"`
-	LogTimeFormat      string                 `yaml:"logTimeFormat"`
-	LogToStdout        string                 `yaml:"logToStdout"`
-	MetricsMaxInMemory int                    `yaml:"metricsMaxInMemory"`
-	CaptureBuffer      int                    `yaml:"captureBuffer"`
-	Performance        PerformanceConfig      `yaml:"performance"`
-	GlobalTTL          int                    `yaml:"globalTTL"`
-	Models             map[string]ModelConfig `yaml:"models"` /* key is model ID */
-	Profiles           map[string][]string    `yaml:"profiles"`
+	HealthCheckTimeout int    `yaml:"healthCheckTimeout"`
+	LogRequests        bool   `yaml:"logRequests"`
+	LogLevel           string `yaml:"logLevel"`
+	LogTimeFormat      string `yaml:"logTimeFormat"`
+	LogToStdout        string `yaml:"logToStdout"`
+	MetricsMaxInMemory int    `yaml:"metricsMaxInMemory"`
+	CaptureBuffer      int    `yaml:"captureBuffer"`
+
+	// MetricsDbPath is the SQLite file persisting the activity log. Empty
+	// resolves to llama-swap.metrics.db next to the config file; ":memory:"
+	// disables persistence (bounded by MetricsMaxInMemory).
+	MetricsDbPath string `yaml:"metricsDbPath"`
+
+	// MetricsRetentionDays bounds the age of persisted metrics; 0 keeps them
+	// forever.
+	MetricsRetentionDays int `yaml:"metricsRetentionDays"`
+
+	Performance PerformanceConfig      `yaml:"performance"`
+	GlobalTTL   int                    `yaml:"globalTTL"`
+	Models      map[string]ModelConfig `yaml:"models"` /* key is model ID */
+	Profiles    map[string][]string    `yaml:"profiles"`
 
 	// routing is the canonical source for swap/scheduling configuration.
 	// New code must read Routing, never the backwards-compat fields below.

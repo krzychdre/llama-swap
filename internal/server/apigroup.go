@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/metricsdb"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/shared"
@@ -161,15 +162,81 @@ func (s *Server) wakeModel(modelID string) {
 	}()
 }
 
-// handleAPIMetrics serves the activity log as a JSON array.
+// parseMetricsFilter reads the model/from/to query params shared by the
+// metrics endpoints. On a malformed timestamp it writes a 400 response and
+// returns ok=false.
+func parseMetricsFilter(w http.ResponseWriter, r *http.Request) (metricsdb.ListFilter, bool) {
+	var f metricsdb.ListFilter
+	q := r.URL.Query()
+	f.Model = q.Get("model")
+
+	for _, p := range []struct {
+		name string
+		dest *time.Time
+	}{{"from", &f.From}, {"to", &f.To}} {
+		if v := q.Get(p.name); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				shared.SendResponse(w, r, http.StatusBadRequest, fmt.Sprintf("invalid '%s' timestamp, use RFC3339 format", p.name))
+				return f, false
+			}
+			*p.dest = t
+		}
+	}
+	return f, true
+}
+
+// handleAPIMetrics serves one page of the activity log, newest first.
+// Query params: limit (default 50, max 500), before_id (keyset cursor:
+// return entries older than this id), from/to (RFC3339), model.
 func (s *Server) handleAPIMetrics(w http.ResponseWriter, r *http.Request) {
-	data, err := s.metrics.getMetricsJSON()
+	filter, ok := parseMetricsFilter(w, r)
+	if !ok {
+		return
+	}
+
+	filter.Limit = 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			shared.SendResponse(w, r, http.StatusBadRequest, "invalid 'limit', must be a positive integer")
+			return
+		}
+		filter.Limit = min(n, 500)
+	}
+	if v := r.URL.Query().Get("before_id"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			shared.SendResponse(w, r, http.StatusBadRequest, "invalid 'before_id', must be a positive integer")
+			return
+		}
+		filter.BeforeID = n
+	}
+
+	page, err := s.metrics.list(filter)
 	if err != nil {
 		shared.SendResponse(w, r, http.StatusInternalServerError, "failed to get metrics")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(data)
+	json.NewEncoder(w).Encode(page)
+}
+
+// handleAPIMetricsSummary serves SQL-computed aggregates (token totals,
+// request/error counts, rate averages and histograms) over the filtered
+// range. Query params: from/to (RFC3339), model.
+func (s *Server) handleAPIMetricsSummary(w http.ResponseWriter, r *http.Request) {
+	filter, ok := parseMetricsFilter(w, r)
+	if !ok {
+		return
+	}
+	summary, err := s.metrics.summary(filter.Model, filter.From, filter.To)
+	if err != nil {
+		shared.SendResponse(w, r, http.StatusInternalServerError, "failed to get metrics summary")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(summary)
 }
 
 // handleAPIPerformance serves the buffered system/GPU stats, optionally
@@ -337,11 +404,11 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	defer event.On(func(e ActivityLogEvent) { sendMetrics([]ActivityLogEntry{e.Metrics}) })()
 	defer event.On(func(e shared.InFlightRequestsEvent) { sendInFlight(e) })()
 
-	// initial payload
+	// initial payload; metrics history is not dumped here — the UI pages it
+	// via GET /api/metrics, SSE only delivers live single-entry events.
 	sendLogData("proxy", s.proxylog.GetHistory())
 	sendLogData("upstream", s.upstreamlog.GetHistory())
 	sendModels()
-	sendMetrics(s.metrics.getMetrics())
 	sendInFlight(s.inflight.Current())
 
 	for {

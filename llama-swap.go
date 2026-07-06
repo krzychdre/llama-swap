@@ -19,6 +19,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/metricsdb"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/server"
@@ -52,6 +53,27 @@ var logTimeFormats = map[string]string{
 	"stampmilli":  time.StampMilli,
 	"stampmicro":  time.StampMicro,
 	"stampnano":   time.StampNano,
+}
+
+// resolveMetricsDbPath resolves the metrics database location: an explicit
+// configured path (or ":memory:") wins, otherwise llama-swap.metrics.db next
+// to the config file (or inside the config dir).
+func resolveMetricsDbPath(configured, configPath, configDir string) string {
+	if configured != "" {
+		return configured
+	}
+	const dbName = "llama-swap.metrics.db"
+	if configPath != "" {
+		if abs, err := filepath.Abs(configPath); err == nil {
+			return filepath.Join(filepath.Dir(abs), dbName)
+		}
+	}
+	if configDir != "" {
+		if abs, err := filepath.Abs(configDir); err == nil {
+			return filepath.Join(abs, dbName)
+		}
+	}
+	return dbName
 }
 
 func main() {
@@ -144,9 +166,30 @@ func main() {
 		proxyLog.Info("performance monitoring is disabled")
 	}
 
+	// metricsStore outlives config reloads; a metricsDbPath change requires a
+	// restart to take effect. Open failure degrades to a bounded in-memory
+	// store so metrics collection never blocks startup.
+	metricsDbPath := resolveMetricsDbPath(cfg.MetricsDbPath, *flagConfig, *flagConfigDir)
+	storeOpts := metricsdb.Options{
+		RetentionDays: cfg.MetricsRetentionDays,
+		MemoryRowCap:  cfg.MetricsMaxInMemory,
+		Logger:        proxyLog,
+	}
+	metricsStore, err := metricsdb.Open(metricsDbPath, storeOpts)
+	if err != nil {
+		proxyLog.Warnf("failed to open metrics database at %s, metrics will not be persisted: %v", metricsDbPath, err)
+		if metricsStore, err = metricsdb.Open(metricsdb.MemoryPath, storeOpts); err != nil {
+			slog.Error("failed to open in-memory metrics store", "error", err)
+			os.Exit(1)
+		}
+	} else if !metricsStore.InMemory() {
+		proxyLog.Infof("metrics database: %s", metricsDbPath)
+	}
+	metricsStore.Start()
+
 	buildInfo := server.BuildInfo{Version: version, Commit: commit, Date: date}
 
-	initialSrv, err := server.New(cfg, muxLog, proxyLog, upstreamLog, perfMon, buildInfo)
+	initialSrv, err := server.New(cfg, muxLog, proxyLog, upstreamLog, perfMon, metricsStore, buildInfo)
 	if err != nil {
 		slog.Error("failed to create server", "error", err)
 		os.Exit(1)
@@ -200,8 +243,9 @@ func main() {
 		if perfMon != nil {
 			perfMon.UpdateConfig(newCfg.Performance)
 		}
+		metricsStore.UpdateRetention(newCfg.MetricsRetentionDays)
 
-		newSrv, err := server.New(newCfg, muxLog, proxyLog, upstreamLog, perfMon, buildInfo)
+		newSrv, err := server.New(newCfg, muxLog, proxyLog, upstreamLog, perfMon, metricsStore, buildInfo)
 		if err != nil {
 			proxyLog.Warnf("failed to build new server during reload: %v", err)
 			return
@@ -339,6 +383,10 @@ func main() {
 
 				if perfMon != nil {
 					perfMon.Stop()
+				}
+
+				if err := metricsStore.Close(); err != nil {
+					proxyLog.Warnf("error closing metrics store: %v", err)
 				}
 
 				close(exitChan)

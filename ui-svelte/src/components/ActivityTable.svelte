@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import type { ActivityLogEntry, InflightRequestEntry, ReqRespCapture } from "../lib/types";
+  import type { MetricsPager } from "../lib/metricsPager.svelte";
   import { cancelInflightRequest, getCapture } from "../stores/api";
   import { persistentStore } from "../stores/persistent";
   import CaptureDialog from "./CaptureDialog.svelte";
@@ -48,6 +49,8 @@
     storagePrefix: string;
     showModelColumn?: boolean;
     showPagination?: boolean;
+    /** Server-side pagination driver; metrics should hold its current page. */
+    pager?: MetricsPager;
     title?: string;
     compact?: boolean;
     emptyMessage?: string;
@@ -60,11 +63,16 @@
     storagePrefix,
     showModelColumn = true,
     showPagination = false,
+    pager,
     title,
     compact = false,
     emptyMessage = "No activity recorded",
     cardClass = "",
   }: Props = $props();
+
+  // Whether pagination is table-local or server-driven never changes at runtime.
+  // svelte-ignore state_referenced_locally
+  const serverMode = !!pager;
 
   function formatDrafted(drafted: number, accepted: number): string {
     return drafted > 0
@@ -227,7 +235,7 @@
         id: "id",
         accessorKey: "id",
         header: "ID",
-        cell: ({ row }) => String(row.original.id + 1),
+        cell: ({ row }) => String(row.original.id),
       },
       {
         id: "time",
@@ -383,6 +391,7 @@
         typeof updater === "function" ? updater(columnVisibility) : updater;
       storedVisibility.set(columnVisibility);
     },
+    manualPagination: serverMode,
     getCoreRowModel: getCoreRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
     getSortedRowModel: getSortedRowModel(),
@@ -529,20 +538,21 @@
       {#if title}
         <Card.Title class="text-sm font-semibold">
           {title}
-          <span class="text-muted-foreground text-xs font-normal">({metrics.length})</span>
+          <span class="text-muted-foreground text-xs font-normal">({pager ? pager.total : metrics.length})</span>
         </Card.Title>
       {/if}
     </div>
     <div class="flex items-center gap-2">
       {#if showPagination}
+        {@const pageSize = pager ? pager.pageSize : pagination.pageSize}
         <span class="text-muted-foreground text-xs">Rows</span>
         <Select.Root
           type="single"
-          value={String(pagination.pageSize)}
-          onValueChange={(v) => table.setPageSize(Number(v))}
+          value={String(pageSize)}
+          onValueChange={(v) => (pager ? pager.setPageSize(Number(v)) : table.setPageSize(Number(v)))}
         >
           <Select.Trigger size="sm" class="h-7 w-[4.5rem] text-xs">
-            {pagination.pageSize}
+            {pageSize}
           </Select.Trigger>
           <Select.Content>
             {#each [5, 10, 25, 50] as size (size)}
@@ -633,7 +643,43 @@
       </Table.Body>
     </Table.Root>
 
-    {#if showPagination && metrics.length > 0}
+    {#if pager && pager.total > 0}
+      {@const serverPageCount = Math.max(1, Math.ceil(pager.total / pager.pageSize))}
+      <div class="flex items-center justify-between gap-2 border-t px-4 py-2 text-sm">
+        <span class="text-muted-foreground text-xs">
+          Page {pager.pageIndex + 1} of {serverPageCount} · {pager.total} total
+        </span>
+        <div class="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onclick={() => pager.first()}
+            disabled={pager.pageIndex === 0 || pager.loading}
+            title="First page"
+          >
+            <ChevronsLeft />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onclick={() => pager.prev()}
+            disabled={pager.pageIndex === 0 || pager.loading}
+            title="Previous page"
+          >
+            <ChevronLeft />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onclick={() => pager.next()}
+            disabled={!pager.hasMore || pager.loading}
+            title="Next page"
+          >
+            <ChevronRight />
+          </Button>
+        </div>
+      </div>
+    {:else if showPagination && metrics.length > 0}
       <div class="flex items-center justify-between gap-2 border-t px-4 py-2 text-sm">
         <span class="text-muted-foreground text-xs">
           Page {pagination.pageIndex + 1} of {pageCount} · {metrics.length} total

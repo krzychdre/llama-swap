@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -297,6 +298,71 @@ func TestBaseRouter_ConcurrencyLimitRejectsBeforeLoadingStream(t *testing.T) {
 	close(bProc.serveBlock)
 	for name, ch := range map[string]chan struct{}{"b": bDone, "a1": aDone1, "a2": aDone2} {
 		waitSignal(t, ch, name+" request finish")
+	}
+}
+
+// timingResetRecorder mimics the metrics middleware's response writer: the
+// router must reset its stream timing once the loading stream ends so the
+// loading chunks don't count as the upstream's first token.
+type timingResetRecorder struct {
+	*httptest.ResponseRecorder
+	mu          sync.Mutex
+	wrote       chan struct{} // closed on the first write (the loading banner)
+	resetCalled bool
+}
+
+func (r *timingResetRecorder) Write(b []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	select {
+	case <-r.wrote:
+	default:
+		close(r.wrote)
+	}
+	return r.ResponseRecorder.Write(b)
+}
+
+func (r *timingResetRecorder) ResetStreamTiming() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.resetCalled = true
+}
+
+func TestBaseRouter_LoadingStreamResetsStreamTiming(t *testing.T) {
+	sendLoading := true
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		Models: map[string]config.ModelConfig{
+			"a": {SendLoadingState: &sendLoading},
+		},
+	}
+	a := newFakeProcess("a")
+	b := newTestBaseWithConfig(t, conf, map[string]process.Process{"a": a}, &stubPlanner{})
+
+	w := &timingResetRecorder{ResponseRecorder: httptest.NewRecorder(), wrote: make(chan struct{})}
+
+	// Hold readiness until the loading stream has demonstrably started writing,
+	// so the loading path cannot be skipped by the model becoming ready first.
+	go func() {
+		select {
+		case <-w.wrote:
+		case <-time.After(2 * time.Second):
+		}
+		a.markReady()
+	}()
+
+	b.ServeHTTP(w, newStreamRequest("a"))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 body=%q", w.Code, w.Body.String())
+	}
+	// Loading chunks stream the banner in small pieces; reasoning_content
+	// deltas only come from the loading writer here.
+	if !strings.Contains(w.Body.String(), "reasoning_content") {
+		t.Fatalf("loading stream did not run; body=%q", w.Body.String())
+	}
+	if !w.resetCalled {
+		t.Fatal("stream timing was not reset after the loading stream finished")
 	}
 }
 

@@ -150,7 +150,7 @@ func upstreamMetricsServer(response string) *Server {
 		proxylog:    proxylog,
 		upstreamlog: logmon.NewWriter(io.Discard),
 		inflight:    newInflightTracker(),
-		metrics:     newMetricsMonitor(proxylog, 10, 0),
+		metrics:     newMetricsMonitor(proxylog, nil, 10, 0),
 		local:       newStubRouter([]string{"m1"}, response),
 		peer:        newStubRouter(nil, ""),
 	}
@@ -380,7 +380,7 @@ func upstreamInflightServer(local *stubRouter) *Server {
 		proxylog:    proxylog,
 		upstreamlog: logmon.NewWriter(io.Discard),
 		inflight:    newInflightTracker(),
-		metrics:     newMetricsMonitor(proxylog, 10, 0),
+		metrics:     newMetricsMonitor(proxylog, nil, 10, 0),
 		local:       local,
 		peer:        newStubRouter(nil, ""),
 	}

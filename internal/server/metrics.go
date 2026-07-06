@@ -5,48 +5,25 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/cache"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
-	"github.com/mostlygeek/llama-swap/internal/ring"
+	"github.com/mostlygeek/llama-swap/internal/metricsdb"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 	"github.com/tidwall/gjson"
 )
 
-// TokenMetrics holds token usage and performance metrics.
-type TokenMetrics struct {
-	CachedTokens    int     `json:"cache_tokens"`
-	DraftTokens     int     `json:"draft_tokens"`
-	DraftAccTokens  int     `json:"draft_acc_tokens"`
-	InputTokens     int     `json:"input_tokens"`
-	OutputTokens    int     `json:"output_tokens"`
-	PromptPerSecond float64 `json:"prompt_per_second"`
-	TokensPerSecond float64 `json:"tokens_per_second"`
-}
-
-// ActivityLogEntry represents parsed token statistics from llama-server logs.
-type ActivityLogEntry struct {
-	ID              int               `json:"id"`
-	Timestamp       time.Time         `json:"timestamp"`
-	Model           string            `json:"model"`
-	ReqPath         string            `json:"req_path"`
-	RespContentType string            `json:"resp_content_type"`
-	RespStatusCode  int               `json:"resp_status_code"`
-	Tokens          TokenMetrics      `json:"tokens"`
-	DurationMs      int               `json:"duration_ms"`
-	HasCapture      bool              `json:"has_capture"`
-	ErrorMsg        string            `json:"error_msg,omitempty"`
-	Metadata        map[string]string `json:"metadata,omitempty"`
-}
+// TokenMetrics and ActivityLogEntry are canonically defined in metricsdb;
+// aliased here so server code keeps its established names.
+type TokenMetrics = metricsdb.TokenMetrics
+type ActivityLogEntry = metricsdb.Entry
 
 // ActivityLogEvent carries a single activity log entry to event subscribers.
 type ActivityLogEvent struct {
@@ -57,28 +34,36 @@ func (e ActivityLogEvent) Type() uint32 {
 	return shared.ActivityLogEventID
 }
 
-// metricsMonitor parses upstream responses for token statistics, keeps a
-// bounded in-memory ring of recent activity, and (when captures are enabled)
+// metricsMonitor parses upstream responses for token statistics, persists
+// activity entries to the metrics store, and (when captures are enabled)
 // stores zstd+CBOR-compressed request/response captures in a sized cache.
 type metricsMonitor struct {
-	mu      sync.RWMutex
-	metrics ring.Buffer[ActivityLogEntry]
-	nextID  int
-	logger  *logmon.Monitor
+	store      *metricsdb.Store
+	ownedStore bool // store opened here rather than supplied; closed by close()
+	logger     *logmon.Monitor
 
 	enableCaptures bool
 	captureCache   *cache.Cache // zstd-compressed CBOR of ReqRespCapture
 }
 
-// newMetricsMonitor creates a metricsMonitor retaining up to maxMetrics entries.
+// newMetricsMonitor creates a metricsMonitor recording into store. A nil
+// store gets an owned in-memory store retaining up to maxMetrics entries.
 // captureBufferMB is the capture buffer size in megabytes; 0 disables captures.
-func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int) *metricsMonitor {
-	if maxMetrics <= 0 {
-		maxMetrics = 1000
+func newMetricsMonitor(logger *logmon.Monitor, store *metricsdb.Store, maxMetrics int, captureBufferMB int) *metricsMonitor {
+	ownedStore := false
+	if store == nil {
+		var err error
+		store, err = metricsdb.Open(metricsdb.MemoryPath, metricsdb.Options{MemoryRowCap: maxMetrics, Logger: logger})
+		if err != nil {
+			// An in-memory open cannot fail short of sqlite itself being broken.
+			panic(fmt.Sprintf("opening in-memory metrics store: %v", err))
+		}
+		ownedStore = true
 	}
 	mm := &metricsMonitor{
+		store:          store,
+		ownedStore:     ownedStore,
 		logger:         logger,
-		metrics:        ring.NewBuffer[ActivityLogEntry](maxMetrics),
 		enableCaptures: captureBufferMB > 0,
 	}
 	if captureBufferMB > 0 {
@@ -87,15 +72,14 @@ func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB i
 	return mm
 }
 
-// queueMetrics adds a metric to the ring and returns its assigned ID.
+// queueMetrics persists a metric and returns its database-assigned ID, or -1
+// when the insert failed.
 func (mp *metricsMonitor) queueMetrics(metric ActivityLogEntry) int {
-	mp.mu.Lock()
-	defer mp.mu.Unlock()
-
-	metric.ID = mp.nextID
-	mp.nextID++
-	mp.metrics.Push(metric)
-	return metric.ID
+	id, err := mp.store.Insert(metric)
+	if err != nil && mp.logger != nil {
+		mp.logger.Warnf("metrics: failed to store activity entry: %v", err)
+	}
+	return id
 }
 
 // emitMetric publishes an ActivityLogEvent for the given metric.
@@ -103,26 +87,42 @@ func (mp *metricsMonitor) emitMetric(metric ActivityLogEntry) {
 	event.Emit(ActivityLogEvent{Metrics: metric})
 }
 
-// getMetrics returns a copy of the current metrics.
-func (mp *metricsMonitor) getMetrics() []ActivityLogEntry {
-	mp.mu.RLock()
-	defer mp.mu.RUnlock()
-
-	result := mp.metrics.Slice()
-	if result == nil {
-		return []ActivityLogEntry{}
-	}
-	if mp.captureCache != nil {
-		for i := range result {
-			result[i].HasCapture = mp.captureCache.Has(result[i].ID)
-		}
-	}
-	return result
+// metricsPage is the paginated /api/metrics response payload.
+type metricsPage struct {
+	Entries []ActivityLogEntry `json:"entries"`
+	Total   int                `json:"total"`
+	HasMore bool               `json:"has_more"`
 }
 
-// getMetricsJSON returns the current metrics as a JSON array.
-func (mp *metricsMonitor) getMetricsJSON() ([]byte, error) {
-	return json.Marshal(mp.getMetrics())
+// list returns a page of stored metrics, newest first, annotating HasCapture
+// from the in-memory capture cache.
+func (mp *metricsMonitor) list(f metricsdb.ListFilter) (metricsPage, error) {
+	entries, total, hasMore, err := mp.store.List(f)
+	if err != nil {
+		return metricsPage{}, err
+	}
+	if entries == nil {
+		entries = []ActivityLogEntry{}
+	}
+	if mp.captureCache != nil {
+		for i := range entries {
+			entries[i].HasCapture = mp.captureCache.Has(entries[i].ID)
+		}
+	}
+	return metricsPage{Entries: entries, Total: total, HasMore: hasMore}, nil
+}
+
+// summary returns SQL-computed aggregates over the filtered range.
+func (mp *metricsMonitor) summary(model string, from, to time.Time) (metricsdb.Summary, error) {
+	return mp.store.Summary(model, from, to)
+}
+
+// close releases the owned in-memory store, if any. Externally supplied
+// stores outlive the server (they are owned by main and survive reloads).
+func (mp *metricsMonitor) close() {
+	if mp.ownedStore {
+		mp.store.Close()
+	}
 }
 
 // record parses a completed response body and stores/emits an activity entry.
@@ -224,7 +224,8 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 // capture (already decompressed by the caller); pass nil to omit it. Returns
 // true if a capture was stored.
 func (mp *metricsMonitor) storeCapture(id int, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string, body []byte) bool {
-	if !mp.enableCaptures {
+	// id < 0 means the entry failed to persist; a capture would be unreachable.
+	if !mp.enableCaptures || id < 0 {
 		return false
 	}
 	capture := ReqRespCapture{
@@ -315,7 +316,10 @@ var usagePaths = []string{"usage", "response.usage", "message.usage"}
 
 // extractUsageTokens reads input/output/cached token counts from a usage
 // gjson.Result, handling the field-name differences across endpoints.
-func extractUsageTokens(usage gjson.Result) (input, output, cached int64, ok bool) {
+// cachedInInput reports whether the cached count is a subset of input
+// (OpenAI-style *_tokens_details.cached_tokens) rather than a separate
+// bucket (Anthropic's cache_read_input_tokens, which input_tokens excludes).
+func extractUsageTokens(usage gjson.Result) (input, output, cached int64, cachedInInput, ok bool) {
 	cached = -1
 	if !usage.Exists() {
 		return
@@ -342,9 +346,11 @@ func extractUsageTokens(usage gjson.Result) (input, output, cached int64, ok boo
 		ok = true
 	} else if v := usage.Get("input_tokens_details.cached_tokens"); v.Exists() {
 		cached = v.Int()
+		cachedInInput = true
 		ok = true
 	} else if v := usage.Get("prompt_tokens_details.cached_tokens"); v.Exists() {
 		cached = v.Int()
+		cachedInInput = true
 		ok = true
 	}
 	return
@@ -354,6 +360,7 @@ func processStreamingResponse(modelID string, start, firstToken, lastToken time.
 	var (
 		inputTokens, outputTokens int64
 		cachedTokens              int64 = -1
+		cachedInInput             bool
 		hasAny                    bool
 		timings                   gjson.Result
 	)
@@ -388,7 +395,7 @@ func processStreamingResponse(modelID string, start, firstToken, lastToken time.
 			if !u.Exists() {
 				continue
 			}
-			i, o, c, ok := extractUsageTokens(u)
+			i, o, c, cInInput, ok := extractUsageTokens(u)
 			if !ok {
 				continue
 			}
@@ -401,6 +408,7 @@ func processStreamingResponse(modelID string, start, firstToken, lastToken time.
 			}
 			if c >= 0 {
 				cachedTokens = c
+				cachedInInput = cInInput
 			}
 		}
 		if t := parsed.Get("timings"); t.Exists() {
@@ -413,22 +421,23 @@ func processStreamingResponse(modelID string, start, firstToken, lastToken time.
 		return ActivityLogEntry{}, fmt.Errorf("no valid JSON data found in stream")
 	}
 
-	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, timings, firstToken, lastToken), nil
+	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, cachedInInput, timings, firstToken, lastToken), nil
 }
 
 func parseMetrics(modelID string, start time.Time, usage, timings gjson.Result) (ActivityLogEntry, error) {
-	input, output, cached, _ := extractUsageTokens(usage)
+	input, output, cached, cachedInInput, _ := extractUsageTokens(usage)
 	// Non-streaming responses have no per-token stream timing, so rates are only
 	// available when the backend supplies llama.cpp timings.
-	return buildMetrics(modelID, start, input, output, cached, timings, time.Time{}, time.Time{}), nil
+	return buildMetrics(modelID, start, input, output, cached, cachedInInput, timings, time.Time{}, time.Time{}), nil
 }
 
 // buildMetrics composes an ActivityLogEntry from accumulated token counts and
 // optional llama-server timings (which override input/output and provide rates).
 // For streaming backends that omit timings (e.g. vllm), firstToken/lastToken
 // bracket the generated stream so rates can be derived from the proxy's own
-// timing; they are zero for non-streaming responses.
-func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, timings gjson.Result, firstToken, lastToken time.Time) ActivityLogEntry {
+// timing; they are zero for non-streaming responses. cachedInInput indicates
+// that cachedTokens is counted inside inputTokens (OpenAI-style usage).
+func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, cachedInInput bool, timings gjson.Result, firstToken, lastToken time.Time) ActivityLogEntry {
 	wallDurationMs := int(time.Since(start).Milliseconds())
 	durationMs := wallDurationMs
 	tokensPerSecond := -1.0
@@ -459,9 +468,28 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 		if genSecs := lastToken.Sub(firstToken).Seconds(); genSecs > 0 && outputTokens > 1 {
 			tokensPerSecond = float64(outputTokens-1) / genSecs
 		}
-		if ttftSecs := firstToken.Sub(start).Seconds(); ttftSecs > 0 && inputTokens > 0 {
-			promptPerSecond = float64(inputTokens) / ttftSecs
+		// Prompt speed must count only tokens actually prefilled. OpenAI-style
+		// usage includes cache hits in the prompt count, so strip them before
+		// dividing by TTFT; Anthropic-style reports them separately already.
+		// A fully cached prompt leaves the speed unknown (-1).
+		prefillTokens := inputTokens
+		if cachedInInput && cachedTokens > 0 {
+			prefillTokens -= cachedTokens
 		}
+		if ttftSecs := firstToken.Sub(start).Seconds(); ttftSecs > 0 && prefillTokens > 0 {
+			promptPerSecond = float64(prefillTokens) / ttftSecs
+		}
+	}
+
+	// Fallback: when neither llama.cpp timings nor usable per-token stream timing
+	// are available - e.g. an upstream that buffers the whole response before
+	// sending it (so firstWrite == lastWrite), or a non-streaming response -
+	// approximate generation throughput from the wall-clock duration. This is
+	// output tokens over the full request time, so it is a lower bound on the
+	// true generation speed for prompt-heavy requests. Prompt speed is left
+	// unknown because prompt and generation time cannot be separated here.
+	if tokensPerSecond < 0 && outputTokens > 0 && wallDurationMs > 0 {
+		tokensPerSecond = float64(outputTokens) / (float64(wallDurationMs) / 1000.0)
 	}
 
 	return ActivityLogEntry{
@@ -590,3 +618,12 @@ func (w *responseBodyCopier) Status() int           { return w.status }
 func (w *responseBodyCopier) StartTime() time.Time  { return w.start }
 func (w *responseBodyCopier) FirstWrite() time.Time { return w.firstWrite }
 func (w *responseBodyCopier) LastWrite() time.Time  { return w.lastWrite }
+
+// ResetStreamTiming discards the write timing recorded so far, so bytes
+// written before the upstream handler runs (e.g. the router's loading-state
+// SSE chunks) don't masquerade as the upstream's first token and wreck the
+// derived token rates. The next Write stamps a fresh firstWrite.
+func (w *responseBodyCopier) ResetStreamTiming() {
+	w.firstWrite = time.Time{}
+	w.lastWrite = time.Time{}
+}

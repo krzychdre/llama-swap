@@ -206,7 +206,18 @@
         "metricsMaxInMemory": {
             "type": "integer",
             "default": 1000,
-            "description": "Maximum number of metrics to keep in memory. Controls how many metrics are stored before older ones are discarded."
+            "description": "Maximum number of metrics kept when persistence is unavailable (metricsDbPath is \":memory:\" or the database cannot be opened)."
+        },
+        "metricsDbPath": {
+            "type": "string",
+            "default": "",
+            "description": "Path to the SQLite file persisting request metrics. Empty resolves to llama-swap.metrics.db next to the config file. Set to \":memory:\" to disable persistence."
+        },
+        "metricsRetentionDays": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 1095,
+            "description": "Days to keep persisted metrics before pruning. 0 keeps them forever."
         },
         "captureBuffer": {
             "type": "integer",

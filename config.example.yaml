@@ -44,11 +44,19 @@ logTimeFormat: ""
 #   - "none": no logs are ever written to stdout
 logToStdout: "proxy"
 
-# metricsMaxInMemory: maximum number of metrics to keep in memory
+# metricsMaxInMemory: maximum number of metrics kept when persistence is
+# unavailable (metricsDbPath is ":memory:" or the database cannot be opened)
 # - optional, default: 1000
-# - controls how many metrics are stored in memory before older ones are discarded
-# - useful for limiting memory usage when processing large volumes of metrics
 metricsMaxInMemory: 1000
+
+# metricsDbPath: SQLite file persisting request metrics across restarts
+# - optional, default: "" (llama-swap.metrics.db next to the config file)
+# - set to ":memory:" to disable persistence
+metricsDbPath: ""
+
+# metricsRetentionDays: days to keep persisted metrics before pruning
+# - optional, default: 1095 (3 years), set to 0 to keep forever
+metricsRetentionDays: 1095
 
 # captureBuffer: how many MBs to allocate for storing request/response captures
 # - optional, default: 10

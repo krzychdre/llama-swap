@@ -35,6 +35,8 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		MetricsMaxInMemory: 1000,
 		CaptureBuffer:      5,
 		GlobalTTL:          0,
+
+		MetricsRetentionDays: 1095, // 3 years
 	}
 	if err = yaml.Unmarshal([]byte(yamlStr), &config); err != nil {
 		return Config{}, err
@@ -58,6 +60,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 
 	if config.GlobalTTL < 0 {
 		return Config{}, fmt.Errorf("globalTTL must be >= 0")
+	}
+
+	if config.MetricsRetentionDays < 0 {
+		return Config{}, fmt.Errorf("metricsRetentionDays must be >= 0")
 	}
 
 	// Apply default for upstream.ignorePaths when not specified. The default

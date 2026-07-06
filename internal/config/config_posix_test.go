@@ -263,9 +263,10 @@ groups:
 				HealthCheckTimeout: 15,
 			},
 		},
-		HealthCheckTimeout: 15,
-		MetricsMaxInMemory: 1000,
-		CaptureBuffer:      5,
+		HealthCheckTimeout:   15,
+		MetricsMaxInMemory:   1000,
+		CaptureBuffer:        5,
+		MetricsRetentionDays: 1095,
 		Performance: PerformanceConfig{
 			Every: 5 * time.Second,
 		},

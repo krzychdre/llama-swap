@@ -4,15 +4,28 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/metricsdb"
 	"github.com/mostlygeek/llama-swap/internal/shared"
 	"github.com/tidwall/gjson"
 )
+
+// getMetrics returns all stored entries oldest-first, mirroring the pre-DB
+// ring-buffer accessor the tests were written against.
+func (mp *metricsMonitor) getMetrics() []ActivityLogEntry {
+	page, err := mp.list(metricsdb.ListFilter{Limit: 500})
+	if err != nil {
+		panic(err)
+	}
+	slices.Reverse(page.Entries)
+	return page.Entries
+}
 
 func TestServer_ParseMetrics_ChatCompletions(t *testing.T) {
 	body := `{"usage":{"prompt_tokens":12,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":4}}}`
@@ -89,6 +102,105 @@ func TestServer_ProcessStreamingResponse_DerivedRates(t *testing.T) {
 	}
 }
 
+// OpenAI-style usage counts cache hits inside prompt_tokens, so the derived
+// prompt speed must only count the tokens actually prefilled — otherwise a
+// mostly-cached prompt reports a wildly inflated speed (vllm prefix caching).
+func TestServer_ProcessStreamingResponse_DerivedRates_ExcludesCachedTokens(t *testing.T) {
+	body := []byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+		"data: {\"usage\":{\"prompt_tokens\":1100,\"completion_tokens\":11,\"prompt_tokens_details\":{\"cached_tokens\":1000}}}\n\n" +
+		"data: [DONE]\n\n")
+
+	start := time.Now()
+	firstToken := start.Add(500 * time.Millisecond) // prefill: (1100-1000) tokens / 0.5s = 200 t/s
+	lastToken := firstToken.Add(1 * time.Second)
+
+	entry, err := processStreamingResponse("m", start, firstToken, lastToken, body)
+	if err != nil {
+		t.Fatalf("processStreamingResponse: %v", err)
+	}
+	if entry.Tokens.InputTokens != 1100 || entry.Tokens.CachedTokens != 1000 {
+		t.Fatalf("tokens = %+v", entry.Tokens)
+	}
+	if entry.Tokens.PromptPerSecond != 200.0 {
+		t.Fatalf("PromptPerSecond = %v, want 200 (cached tokens excluded)", entry.Tokens.PromptPerSecond)
+	}
+}
+
+// A fully cached prompt has no prefill to measure: speed stays unknown rather
+// than reporting a nonsense number.
+func TestServer_ProcessStreamingResponse_DerivedRates_FullyCachedPrompt(t *testing.T) {
+	body := []byte("data: {\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":1000}}}\n\n" +
+		"data: [DONE]\n\n")
+
+	start := time.Now()
+	firstToken := start.Add(100 * time.Millisecond)
+	lastToken := firstToken.Add(1 * time.Second)
+
+	entry, err := processStreamingResponse("m", start, firstToken, lastToken, body)
+	if err != nil {
+		t.Fatalf("processStreamingResponse: %v", err)
+	}
+	if entry.Tokens.PromptPerSecond != -1 {
+		t.Fatalf("PromptPerSecond = %v, want -1 (fully cached prompt)", entry.Tokens.PromptPerSecond)
+	}
+}
+
+// Anthropic-style usage reports cache reads in a separate bucket that
+// input_tokens already excludes — no subtraction must happen there.
+func TestServer_ProcessStreamingResponse_DerivedRates_AnthropicCacheSeparate(t *testing.T) {
+	body := []byte("data: {\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":11,\"cache_read_input_tokens\":1000}}}\n\n")
+
+	start := time.Now()
+	firstToken := start.Add(500 * time.Millisecond) // prefill: 100 tokens / 0.5s = 200 t/s
+	lastToken := firstToken.Add(1 * time.Second)
+
+	entry, err := processStreamingResponse("m", start, firstToken, lastToken, body)
+	if err != nil {
+		t.Fatalf("processStreamingResponse: %v", err)
+	}
+	if entry.Tokens.InputTokens != 100 || entry.Tokens.CachedTokens != 1000 {
+		t.Fatalf("tokens = %+v", entry.Tokens)
+	}
+	if entry.Tokens.PromptPerSecond != 200.0 {
+		t.Fatalf("PromptPerSecond = %v, want 200 (no double subtraction)", entry.Tokens.PromptPerSecond)
+	}
+}
+
+// An upstream that buffers the whole SSE response before sending it delivers a
+// single write, so firstToken == lastToken and per-token stream timing is
+// unusable. Generation throughput must still be derived from the wall clock
+// instead of being reported as unknown. Uses the Anthropic /v1/messages shape
+// (usage split across message_start's message.usage and message_delta's usage).
+func TestServer_ProcessStreamingResponse_WallClockFallback(t *testing.T) {
+	body := []byte("event: message_start\n" +
+		"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":36472,\"output_tokens\":0}}}\n\n" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"},\"index\":0}\n\n" +
+		"event: message_delta\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":36472,\"output_tokens\":108}}\n\n")
+
+	start := time.Now().Add(-1 * time.Second)
+	// Single batched write: firstToken == lastToken, so stream timing is unusable.
+	writeAt := time.Now()
+
+	entry, err := processStreamingResponse("m", start, writeAt, writeAt, body)
+	if err != nil {
+		t.Fatalf("processStreamingResponse: %v", err)
+	}
+	if entry.Tokens.InputTokens != 36472 || entry.Tokens.OutputTokens != 108 {
+		t.Fatalf("tokens = %+v", entry.Tokens)
+	}
+	// Throughput derived from wall clock (~108 tokens over ~1s) must be positive,
+	// not the -1 "unknown" sentinel.
+	if entry.Tokens.TokensPerSecond <= 0 {
+		t.Fatalf("TokensPerSecond = %v, want > 0 (wall-clock fallback)", entry.Tokens.TokensPerSecond)
+	}
+	// Prompt speed cannot be separated from generation here, so it stays unknown.
+	if entry.Tokens.PromptPerSecond != -1 {
+		t.Fatalf("PromptPerSecond = %v, want -1 (unknown)", entry.Tokens.PromptPerSecond)
+	}
+}
+
 func TestServer_EnsureStreamUsage(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -115,7 +227,7 @@ func TestServer_EnsureStreamUsage(t *testing.T) {
 }
 
 func TestMetricsMonitor_RecordMetadata(t *testing.T) {
-	mm := newMetricsMonitor(nil, 10, 0)
+	mm := newMetricsMonitor(nil, nil, 10, 0)
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"usage":{}}`))
 	r = r.WithContext(shared.SetContext(r.Context(), shared.ReqContextData{
 		ModelID:  "m",
@@ -142,7 +254,7 @@ func TestMetricsMonitor_RecordMetadata(t *testing.T) {
 }
 
 func TestMetricsMonitor_RecordFailedRequestCapture(t *testing.T) {
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 10, 5)
+	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), nil, 10, 5)
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	reqHeaders := map[string]string{"content-type": "application/json"}
 
@@ -187,7 +299,7 @@ func TestMetricsMonitor_RecordFailedRequestCapture(t *testing.T) {
 
 func TestMetricsMonitor_RecordFailedRequestStatusFallback(t *testing.T) {
 	// Non-JSON error body: ErrorMsg falls back to the HTTP status text.
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 10, 5)
+	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), nil, 10, 5)
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
 	w := httptest.NewRecorder()
@@ -207,7 +319,7 @@ func TestMetricsMonitor_RecordFailedRequestStatusFallback(t *testing.T) {
 }
 
 func TestMetricsMonitor_RecordFailedRequestCaptureDisabled(t *testing.T) {
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 10, 0) // captures disabled
+	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), nil, 10, 0) // captures disabled
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
 	w := httptest.NewRecorder()
@@ -234,7 +346,7 @@ func TestMetricsMonitor_RecordFailedRequestCaptureDisabled(t *testing.T) {
 }
 
 func TestMetricsMonitor_RecordDecompressionFailureSetsErrorMsg(t *testing.T) {
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 10, 5)
+	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), nil, 10, 5)
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
 	w := httptest.NewRecorder()
@@ -259,7 +371,7 @@ func TestMetricsMonitor_RecordDecompressionFailureSetsErrorMsg(t *testing.T) {
 }
 
 func TestMetricsMonitor_DecodeResponseBody(t *testing.T) {
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 10, 5)
+	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), nil, 10, 5)
 
 	// No Content-Encoding: body returned unchanged.
 	w := httptest.NewRecorder()
@@ -281,6 +393,27 @@ func TestMetricsMonitor_DecodeResponseBody(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("expected nil body on failure, got %q", got)
+	}
+}
+
+// ResetStreamTiming clears recorded write timing (used after loading-state
+// chunks) and the next write stamps a fresh firstWrite.
+func TestServer_BodyCopier_ResetStreamTiming(t *testing.T) {
+	copier := newBodyCopier(httptest.NewRecorder())
+
+	copier.Write([]byte("loading banner"))
+	if copier.FirstWrite().IsZero() || copier.LastWrite().IsZero() {
+		t.Fatal("write did not stamp stream timing")
+	}
+
+	copier.ResetStreamTiming()
+	if !copier.FirstWrite().IsZero() || !copier.LastWrite().IsZero() {
+		t.Fatal("ResetStreamTiming did not clear stream timing")
+	}
+
+	copier.Write([]byte("first upstream token"))
+	if copier.FirstWrite().IsZero() {
+		t.Fatal("write after reset did not stamp a fresh firstWrite")
 	}
 }
 
@@ -328,7 +461,7 @@ func TestServer_ParseMetrics_Infill(t *testing.T) {
 // an /upstream/<model>/v1/audio/speech request uses the path-specific capture
 // mask (headers only) rather than falling back to captureAll.
 func TestServer_MetricsMiddleware_UpstreamAudioCaptureSkipsRespBody(t *testing.T) {
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 100, 5)
+	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), nil, 100, 5)
 	cfg := config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
 
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

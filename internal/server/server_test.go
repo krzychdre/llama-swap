@@ -75,7 +75,7 @@ func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 		proxylog:    proxylog,
 		upstreamlog: logmon.NewWriter(io.Discard),
 		inflight:    newInflightTracker(),
-		metrics:     newMetricsMonitor(proxylog, 0, 0),
+		metrics:     newMetricsMonitor(proxylog, nil, 0, 0),
 		local:       local,
 		peer:        peer,
 		shutdownCtx: ctx,
@@ -96,7 +96,7 @@ func TestServer_New_GroupConfig(t *testing.T) {
 	discard := logmon.NewWriter(io.Discard)
 	cfg := config.Config{HealthCheckTimeout: 15}
 	cfg.Routing.Router.Use = "group"
-	s, err := New(cfg, discard, discard, discard, nil, BuildInfo{})
+	s, err := New(cfg, discard, discard, discard, nil, nil, BuildInfo{})
 	if err != nil {
 		t.Fatalf("New (group): %v", err)
 	}
@@ -113,7 +113,7 @@ func TestServer_New_MatrixConfig(t *testing.T) {
 	cfg := config.Config{HealthCheckTimeout: 15}
 	cfg.Routing.Router.Use = "matrix"
 	cfg.Routing.Router.Settings.Matrix = &config.MatrixConfig{}
-	s, err := New(cfg, discard, discard, discard, nil, BuildInfo{})
+	s, err := New(cfg, discard, discard, discard, nil, nil, BuildInfo{})
 	if err != nil {
 		t.Fatalf("New (matrix): %v", err)
 	}
