@@ -1,6 +1,11 @@
 <script lang="ts">
   import { models } from "../stores/api";
   import type { MetricsFilters } from "../lib/metricsPager.svelte";
+  import {
+    ACTIVITY_PRESETS,
+    DEFAULT_PRESET,
+    presetFilters,
+  } from "../lib/activityPresets";
   import * as Select from "$lib/components/ui/select/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
 
@@ -10,39 +15,20 @@
 
   let { onchange }: Props = $props();
 
-  const PRESETS = [
-    { id: "all", label: "All time" },
-    { id: "1h", label: "Last hour" },
-    { id: "24h", label: "Last 24 hours" },
-    { id: "7d", label: "Last 7 days" },
-    { id: "30d", label: "Last 30 days" },
-    { id: "custom", label: "Custom range" },
-  ];
-  const PRESET_MS: Record<string, number> = {
-    "1h": 3600_000,
-    "24h": 24 * 3600_000,
-    "7d": 7 * 24 * 3600_000,
-    "30d": 30 * 24 * 3600_000,
-  };
-
-  let preset = $state("all");
+  let preset = $state(DEFAULT_PRESET);
   let model = $state("");
   let customFrom = $state("");
   let customTo = $state("");
 
-  let presetLabel = $derived(PRESETS.find((p) => p.id === preset)?.label ?? "All time");
+  let presetLabel = $derived(
+    ACTIVITY_PRESETS.find((p) => p.id === preset)?.label ?? "All time",
+  );
   let modelIds = $derived([...new Set($models.map((m) => m.id))].sort());
 
   function emit() {
-    let from: string | undefined;
-    let to: string | undefined;
-    if (preset === "custom") {
-      if (customFrom) from = new Date(customFrom).toISOString();
-      if (customTo) to = new Date(customTo).toISOString();
-    } else if (preset !== "all") {
-      from = new Date(Date.now() - PRESET_MS[preset]).toISOString();
-    }
-    onchange({ from, to, model: model || undefined });
+    onchange(
+      presetFilters(preset, { customFrom, customTo, model }) as MetricsFilters,
+    );
   }
 </script>
 
@@ -60,7 +46,7 @@
       {presetLabel}
     </Select.Trigger>
     <Select.Content>
-      {#each PRESETS as p (p.id)}
+      {#each ACTIVITY_PRESETS as p (p.id)}
         <Select.Item value={p.id}>{p.label}</Select.Item>
       {/each}
     </Select.Content>

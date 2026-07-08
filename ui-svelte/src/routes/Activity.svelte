@@ -3,6 +3,7 @@
   import { fetchMetricsSummary, inflightRequestEntries, metrics } from "../stores/api";
   import type { MetricsSummary } from "../lib/types";
   import { MetricsPager, type MetricsFilters } from "../lib/metricsPager.svelte";
+  import { DEFAULT_PRESET, presetFilters } from "../lib/activityPresets";
   import { persistentStore } from "../stores/persistent";
   import ActivityStats from "../components/ActivityStats.svelte";
   import ActivityTable from "../components/ActivityTable.svelte";
@@ -12,8 +13,14 @@
 
   const storedPageSize = persistentStore<number>("activity-page-size", 10);
 
+  // Seed the pager with the default preset ("Today") so the initial load
+  // matches the dropdown's default selection instead of silently using
+  // "All time".
   // svelte-ignore state_referenced_locally
-  const pager = new MetricsPager({ pageSize: $storedPageSize });
+  const pager = new MetricsPager({
+    pageSize: $storedPageSize,
+    filters: presetFilters(DEFAULT_PRESET) as MetricsFilters,
+  });
   let summary = $state<MetricsSummary | null>(null);
 
   $effect(() => {
