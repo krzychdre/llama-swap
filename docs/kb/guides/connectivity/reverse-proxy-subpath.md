@@ -19,12 +19,19 @@ automatically.
 ```nginx
 location /asubpath/llama-swap/ {
     proxy_pass http://127.0.0.1:8080/;   # trailing slash strips the prefix
+    proxy_set_header Host $host;         # keep the browser's origin usable
     proxy_read_timeout 3600s;            # streams are long-lived
 }
 ```
 
 The trailing slash on `proxy_pass` is what does the rewrite; without it
 llama-swap receives `/asubpath/llama-swap/...` and answers 404.
+
+`proxy_set_header Host $host` is required for the UI. Without it nginx sends
+its own address in `Host` while the browser's `Origin` names the public host,
+and every state-changing call from the page — profile switch, sleep, wake,
+cancel, unload — is refused with HTTP 403. A loopback proxy that reports the
+public host in `X-Forwarded-Host` instead is also accepted.
 
 ## Caddy
 

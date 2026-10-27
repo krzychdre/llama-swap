@@ -14,25 +14,54 @@ func TestServer_SameOriginMiddleware(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	// proxied cases model the documented nginx setup: it keeps Host as its own
+	// address and reports the public host only in X-Forwarded-Host.
 	cases := []struct {
-		name   string
-		method string
-		origin string
-		want   int
+		name       string
+		method     string
+		host       string
+		origin     string
+		remoteAddr string
+		forwarded  string
+		want       int
 	}{
-		{"post without Origin", http.MethodPost, "", http.StatusOK},
-		{"post from the same host", http.MethodPost, "http://example.com", http.StatusOK},
-		{"post from another host", http.MethodPost, "http://evil.example", http.StatusForbidden},
-		{"put from another host", http.MethodPut, "https://evil.example", http.StatusForbidden},
-		{"delete from another host", http.MethodDelete, "http://evil.example", http.StatusForbidden},
-		{"get from another host is not state changing", http.MethodGet, "http://evil.example", http.StatusOK},
+		{"post without Origin", http.MethodPost, "example.com", "", "203.0.113.9:4000", "", http.StatusOK},
+		{"post from the same host", http.MethodPost, "example.com", "http://example.com", "203.0.113.9:4000", "", http.StatusOK},
+		{"post from another host", http.MethodPost, "example.com", "http://evil.example", "203.0.113.9:4000", "", http.StatusForbidden},
+		{"put from another host", http.MethodPut, "example.com", "https://evil.example", "203.0.113.9:4000", "", http.StatusForbidden},
+		{"delete from another host", http.MethodDelete, "example.com", "http://evil.example", "203.0.113.9:4000", "", http.StatusForbidden},
+		{"get from another host is not state changing", http.MethodGet, "example.com", "http://evil.example", "203.0.113.9:4000", "", http.StatusOK},
+		{
+			"post from the public host through a loopback proxy",
+			http.MethodPost, "127.0.0.1:8080", "https://real-host", "127.0.0.1:4000", "real-host", http.StatusOK,
+		},
+		{
+			"post from the public host through a remote proxy",
+			http.MethodPost, "127.0.0.1:8080", "https://real-host", "203.0.113.9:4000", "real-host", http.StatusForbidden,
+		},
+		{
+			"post from a foreign origin next to a forwarded host",
+			http.MethodPost, "127.0.0.1:8080", "https://evil.example", "127.0.0.1:4000", "real-host", http.StatusForbidden,
+		},
+		{
+			"post from a loopback proxy that forwards no host",
+			http.MethodPost, "127.0.0.1:8080", "https://real-host", "127.0.0.1:4000", "", http.StatusForbidden,
+		},
+		{
+			"post with a malformed Origin",
+			http.MethodPost, "example.com", "http://example.com:bad port", "127.0.0.1:4000", "", http.StatusForbidden,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			r := httptest.NewRequest(c.method, "/api/models/unload", nil)
-			r.Host = "example.com"
+			r.Host = c.host
+			r.RemoteAddr = c.remoteAddr
 			if c.origin != "" {
 				r.Header.Set("Origin", c.origin)
+			}
+			if c.forwarded != "" {
+				r.Header.Set("X-Forwarded-Host", c.forwarded)
 			}
 			w := httptest.NewRecorder()
 			sameOriginMiddleware(final).ServeHTTP(w, r)
