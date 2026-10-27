@@ -251,19 +251,6 @@ func main() {
 		c.String(200, *responseMessage)
 	})
 
-	r.GET("/env", func(c *gin.Context) {
-		c.Header("Content-Type", "text/plain")
-		c.String(200, *responseMessage)
-
-		// Get environment variables
-		envVars := os.Environ()
-
-		// Write each environment variable to the response
-		for _, envVar := range envVars {
-			c.String(200, envVar)
-		}
-	})
-
 	// Set up the /health endpoint handler function
 	r.GET("/health", func(c *gin.Context) {
 		c.Header("Content-Type", "application/json")

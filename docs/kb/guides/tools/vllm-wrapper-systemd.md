@@ -4,7 +4,7 @@ summary: Start vLLM as a transient systemd user service from vllm-wrapper so it 
 category: guides
 tags: [vllm-wrapper, vllm, systemd, systemd-run, journal, linux, tools]
 config_keys: [models.*.cmd, models.*.cmdStop]
-updated: 2026-10-23
+updated: 2026-10-27
 ---
 
 # Run vLLM under systemd with vllm-wrapper
@@ -48,7 +48,7 @@ models:
     cmd: |
       vllm-wrapper serve
       --vllm-url http://127.0.0.1:18000
-      --listen :${PORT}
+      --listen 127.0.0.1:${PORT}
       --wait-timeout 5m
       --journal-unit vllm-qwen.service
       --

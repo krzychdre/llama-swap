@@ -102,6 +102,41 @@ func TestStartDaemon(t *testing.T) {
 }
 
 // TestStartDaemonArgv verifies that multiple startArgs are passed as separate argv values.
+func TestServeHandler_ControlPathsLoopbackOnly(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		remoteAddr string
+		want       int
+	}{
+		{"sleep from loopback", http.MethodPost, "/sleep", "127.0.0.1:5000", http.StatusOK},
+		{"wake_up from ipv6 loopback", http.MethodPost, "/wake_up", "[::1]:5000", http.StatusOK},
+		{"sleep from the network", http.MethodPost, "/sleep", "192.168.1.20:5000", http.StatusForbidden},
+		{"wake_up from the network", http.MethodPost, "/wake_up", "192.168.1.20:5000", http.StatusForbidden},
+		{"sleep from the network without a port", http.MethodPost, "/sleep", "192.168.1.20", http.StatusForbidden},
+		{"other paths from the network", http.MethodPost, "/v1/chat/completions", "192.168.1.20:5000", http.StatusOK},
+		{"sleep read from the network", http.MethodGet, "/sleep", "192.168.1.20:5000", http.StatusOK},
+	}
+
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := newServeHandler(upstream)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.RemoteAddr = tc.remoteAddr
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("got status %d, want %d", rec.Code, tc.want)
+			}
+		})
+	}
+}
+
 func TestStartDaemonArgv(t *testing.T) {
 	tmpDir := t.TempDir()
 	argvFile := filepath.Join(tmpDir, "argv.txt")
