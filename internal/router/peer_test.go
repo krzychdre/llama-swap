@@ -298,6 +298,56 @@ func TestPeer_ServeHTTP_PeerModelNotFound(t *testing.T) {
 	}
 }
 
+func TestPeer_ServeHTTP_ClientAPIKeyReplaced(t *testing.T) {
+	tests := []struct {
+		name         string
+		peerAPIKey   string
+		wantAuth     string
+		wantAPIKeyHd string
+	}{
+		{"peer without apiKey drops the client key", "", "", ""},
+		{"peer with apiKey sends its own", "peer-key", "Bearer peer-key", "peer-key"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotAuth, gotAPIKey string
+			testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAuth = r.Header.Get("Authorization")
+				gotAPIKey = r.Header.Get("x-api-key")
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer testServer.Close()
+
+			proxyURL, _ := url.Parse(testServer.URL)
+			pr, err := NewPeer(config.Config{Peers: config.PeerDictionaryConfig{
+				"peer1": {
+					Proxy:    testServer.URL,
+					ProxyURL: proxyURL,
+					ApiKey:   tc.peerAPIKey,
+					Models:   []string{"test-model"},
+				},
+			}}, testLogger)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			req.Header.Set("Authorization", "Bearer client-key")
+			req.Header.Set("x-api-key", "client-key")
+			*req = *req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{Model: "test-model", ModelID: "test-model"}))
+
+			pr.ServeHTTP(httptest.NewRecorder(), req)
+
+			if gotAuth != tc.wantAuth {
+				t.Errorf("Authorization = %q, want %q", gotAuth, tc.wantAuth)
+			}
+			if gotAPIKey != tc.wantAPIKeyHd {
+				t.Errorf("x-api-key = %q, want %q", gotAPIKey, tc.wantAPIKeyHd)
+			}
+		})
+	}
+}
+
 func TestPeer_ServeHTTP_ApiKeyInjection(t *testing.T) {
 	var receivedAuthHeader string
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -4,7 +4,7 @@ summary: How ttl, globalTTL, unloadTimeout and Docker cmdStop interact, plus how
 category: guides
 tags: [ttl, unload, vram, memory, idle, docker, container, cmd-stop]
 config_keys: [globalTTL, unloadTimeout, models.*.ttl, models.*.unloadTimeout, models.*.cmdStop]
-updated: 2026-08-25
+updated: 2026-10-27
 ---
 
 # Automatic model unloading with ttl
@@ -75,10 +75,13 @@ models:
 ## Unloading on demand
 
 ```console
-$ curl http://localhost:8080/unload                        # everything
+$ curl -X POST http://localhost:8080/unload                 # everything
 $ curl -X POST http://localhost:8080/api/models/unload      # everything
 $ curl -X POST http://localhost:8080/api/models/unload/qwen-coder
 ```
+
+`/unload` accepts only POST, so a plain `GET /unload` in a browser address bar
+or an `<img>` tag on another site no longer stops every model.
 
 The web UI's model list has an unload button per model that hits the same
 endpoint.

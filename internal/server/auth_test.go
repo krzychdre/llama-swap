@@ -9,6 +9,40 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 )
 
+func TestServer_SameOriginMiddleware(t *testing.T) {
+	final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	cases := []struct {
+		name   string
+		method string
+		origin string
+		want   int
+	}{
+		{"post without Origin", http.MethodPost, "", http.StatusOK},
+		{"post from the same host", http.MethodPost, "http://example.com", http.StatusOK},
+		{"post from another host", http.MethodPost, "http://evil.example", http.StatusForbidden},
+		{"put from another host", http.MethodPut, "https://evil.example", http.StatusForbidden},
+		{"delete from another host", http.MethodDelete, "http://evil.example", http.StatusForbidden},
+		{"get from another host is not state changing", http.MethodGet, "http://evil.example", http.StatusOK},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := httptest.NewRequest(c.method, "/api/models/unload", nil)
+			r.Host = "example.com"
+			if c.origin != "" {
+				r.Header.Set("Origin", c.origin)
+			}
+			w := httptest.NewRecorder()
+			sameOriginMiddleware(final).ServeHTTP(w, r)
+			if w.Code != c.want {
+				t.Errorf("status = %d, want %d", w.Code, c.want)
+			}
+		})
+	}
+}
+
 func TestServer_RequestContextMiddleware(t *testing.T) {
 	cfg := config.Config{
 		Models: map[string]config.ModelConfig{

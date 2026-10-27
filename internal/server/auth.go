@@ -1,7 +1,9 @@
 package server
 
 import (
+	"crypto/subtle"
 	"net/http"
+	"net/url"
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -23,10 +25,7 @@ func CreateAuthMiddleware(cfg config.Config) chain.Middleware {
 
 			valid := false
 			for _, key := range keys {
-				if provided == key {
-					valid = true
-					break
-				}
+				valid = subtle.ConstantTimeCompare([]byte(provided), []byte(key)) == 1 || valid
 			}
 			if !valid {
 				w.Header().Set("WWW-Authenticate", `Basic realm="llama-swap"`)
@@ -37,6 +36,37 @@ func CreateAuthMiddleware(cfg config.Config) chain.Middleware {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// sameOriginMiddleware rejects a state-changing request whose Origin header
+// names a host other than the one it was addressed to, so a page on another
+// site cannot drive the API with a form post or an image request. Requests
+// without an Origin header (curl, SDKs, MCP clients) pass through.
+var sameOriginMiddleware chain.Middleware = func(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		default:
+			next.ServeHTTP(w, r)
+			return
+		}
+		if isCrossOrigin(r) {
+			swaputil.SendResponse(w, r, http.StatusForbidden, "cross-origin request rejected")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isCrossOrigin reports whether r carries an Origin header naming a host other
+// than the one it was sent to. An unparseable Origin counts as cross-origin.
+func isCrossOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	return err != nil || parsed.Host != r.Host
 }
 
 // CreateRequestContextMiddleware returns middleware that extracts model and

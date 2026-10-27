@@ -63,13 +63,22 @@ func bodyTooLargeFrom(err error) *requestBodyError {
 	return nil
 }
 
-// prepareModelBody caps the request body at maxBytes and makes its
-// Content-Type match what the endpoint expects. See normalizeBodyContentType.
-func prepareModelBody(w http.ResponseWriter, r *http.Request, maxBytes int64) *requestBodyError {
+// capRequestBody rejects a declared body over maxBytes and caps the reader, so
+// a chunked upload that declares no length stops at the same limit.
+func capRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) *requestBodyError {
 	if r.ContentLength > maxBytes {
 		return bodyTooLarge(maxBytes)
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	return nil
+}
+
+// prepareModelBody caps the request body at maxBytes and makes its
+// Content-Type match what the endpoint expects. See normalizeBodyContentType.
+func prepareModelBody(w http.ResponseWriter, r *http.Request, maxBytes int64) *requestBodyError {
+	if bodyErr := capRequestBody(w, r, maxBytes); bodyErr != nil {
+		return bodyErr
+	}
 	return normalizeBodyContentType(r, bodyKindForPath(r.URL.Path))
 }
 
@@ -137,6 +146,20 @@ func normalizeBodyContentType(r *http.Request, kind bodyKind) *requestBodyError 
 		return badBody("no model id could be identified: this endpoint expects multipart/form-data but Content-Type is %s", shownType)
 	}
 	return badBody("no model id could be identified: Content-Type is %s and the body is neither a JSON object nor a form with a \"model\" field; send JSON with Content-Type: application/json", shownType)
+}
+
+// createRequestBodyLimitMiddleware caps the request body at maxBytes without
+// touching its Content-Type, for routes that forward the body unchanged.
+func createRequestBodyLimitMiddleware(maxBytes int64) chain.Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if bodyErr := capRequestBody(w, r, maxBytes); bodyErr != nil {
+				swaputil.SendResponse(w, r, bodyErr.status, bodyErr.message)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // createContentTypeMiddleware returns middleware that tolerates a missing or

@@ -53,32 +53,36 @@ func TestServer_ActivitySourceStripsClientPort(t *testing.T) {
 
 func TestServer_ActivitySourceForwardedHeaders(t *testing.T) {
 	tests := []struct {
-		name  string
-		setup func(*http.Request)
-		want  string
+		name       string
+		remoteAddr string
+		setup      func(*http.Request)
+		want       string
 	}{
-		{"x-forwarded-for", func(r *http.Request) {
+		{"x-forwarded-for", "127.0.0.1:54321", func(r *http.Request) {
 			r.Header.Set("X-Forwarded-For", "203.0.113.10, 10.0.0.1")
 		}, "xff:203.0.113.10"},
-		{"x-real-ip", func(r *http.Request) {
+		{"x-real-ip", "127.0.0.1:54321", func(r *http.Request) {
 			r.Header.Set("X-Real-IP", "203.0.113.20")
 		}, "xff:203.0.113.20"},
-		{"x-forwarded-for takes priority over x-real-ip", func(r *http.Request) {
+		{"x-forwarded-for takes priority over x-real-ip", "127.0.0.1:54321", func(r *http.Request) {
 			r.Header.Set("X-Forwarded-For", "203.0.113.10")
 			r.Header.Set("X-Real-IP", "203.0.113.20")
 		}, "xff:203.0.113.10"},
-		{"x-forwarded-for whitespace-only first entry falls back to x-real-ip", func(r *http.Request) {
+		{"x-forwarded-for whitespace-only first entry falls back to x-real-ip", "127.0.0.1:54321", func(r *http.Request) {
 			r.Header.Set("X-Forwarded-For", "   , 10.0.0.1")
 			r.Header.Set("X-Real-IP", "203.0.113.20")
 		}, "xff:203.0.113.20"},
-		{"x-forwarded-for empty first entry falls back to remote addr", func(r *http.Request) {
+		{"x-forwarded-for empty first entry falls back to remote addr", "127.0.0.1:54321", func(r *http.Request) {
 			r.Header.Set("X-Forwarded-For", ",10.0.0.1")
+		}, "ip:127.0.0.1"},
+		{"headers from a remote client are ignored", "192.168.1.10:54321", func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", "203.0.113.10")
 		}, "ip:192.168.1.10"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodGet, "/", nil)
-			r.RemoteAddr = "192.168.1.10:54321"
+			r.RemoteAddr = test.remoteAddr
 			test.setup(r)
 			if got := activitySource(r); got != test.want {
 				t.Fatalf("activitySource() = %q, want %q", got, test.want)

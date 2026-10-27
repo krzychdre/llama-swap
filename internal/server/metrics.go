@@ -615,6 +615,26 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 	}
 }
 
+// maxBufferedBodyBytes caps how much of a response body the metrics buffer
+// keeps. The client still receives the complete body; only the copy parsed for
+// token counts is truncated.
+const maxBufferedBodyBytes = 8 << 20
+
+// cappedBuffer keeps the first maxBufferedBodyBytes written to it and discards
+// the rest.
+type cappedBuffer struct{ buf *bytes.Buffer }
+
+func (c cappedBuffer) Write(p []byte) (int, error) {
+	if room := maxBufferedBodyBytes - c.buf.Len(); room > 0 {
+		if len(p) > room {
+			c.buf.Write(p[:room])
+		} else {
+			c.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
 // decompressBody decompresses the body based on the Content-Encoding header.
 func decompressBody(body []byte, encoding string) ([]byte, error) {
 	switch strings.ToLower(strings.TrimSpace(encoding)) {
@@ -624,11 +644,11 @@ func decompressBody(body []byte, encoding string) ([]byte, error) {
 			return nil, err
 		}
 		defer reader.Close()
-		return io.ReadAll(reader)
+		return io.ReadAll(io.LimitReader(reader, maxBufferedBodyBytes))
 	case "deflate":
 		reader := flate.NewReader(bytes.NewReader(body))
 		defer reader.Close()
-		return io.ReadAll(reader)
+		return io.ReadAll(io.LimitReader(reader, maxBufferedBodyBytes))
 	default:
 		return body, nil
 	}
@@ -670,7 +690,7 @@ func newBodyCopier(w http.ResponseWriter) *responseBodyCopier {
 	return &responseBodyCopier{
 		ResponseWriter: w,
 		body:           buf,
-		tee:            io.MultiWriter(w, buf),
+		tee:            io.MultiWriter(w, cappedBuffer{buf: buf}),
 		status:         http.StatusOK,
 		start:          time.Now(),
 	}
