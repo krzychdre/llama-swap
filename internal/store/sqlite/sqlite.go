@@ -9,6 +9,7 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"os"
 	"strings"
 
 	"github.com/pressly/goose/v3"
@@ -62,6 +63,12 @@ func New(path string) (*Store, error) {
 		if !strings.EqualFold(mode, "wal") {
 			db.Close()
 			return nil, fmt.Errorf("enable sqlite store WAL mode: got %q", mode)
+		}
+		// The activity table holds request paths, metadata and error messages.
+		// SQLite creates the file 0644 & ~umask otherwise.
+		if err := os.Chmod(dsn, 0o600); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("restrict sqlite store permissions: %w", err)
 		}
 	}
 	if err := runMigrations(ctx, db); err != nil {

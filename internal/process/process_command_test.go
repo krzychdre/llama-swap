@@ -154,6 +154,67 @@ func TestProcessCommand_EnsureReadyIsIdempotent(t *testing.T) {
 	}
 }
 
+// The start error reaches the HTTP client through SendError, so it must name
+// the program without the credential flag values that follow it.
+func TestProcessCommand_StartErrorHidesFlagValues(t *testing.T) {
+	const secret = "sk-live-secret-value"
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:           fmt.Sprintf("/nonexistent/llama-server --api-key %s --port 1", secret),
+		Proxy:         "http://127.0.0.1:1",
+		CheckEndpoint: "none",
+	})
+
+	err := p.EnsureReady(context.Background(), testStartTimeout)
+	if err == nil {
+		t.Fatal("expected the missing program to fail the start")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("start error leaked the api key: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/nonexistent/llama-server") {
+		t.Errorf("start error does not name the program: %v", err)
+	}
+}
+
+// The debug line feeding the /logs buffer must not carry flag values or env
+// value halves.
+func TestProcessCommand_StartLogHidesSecrets(t *testing.T) {
+	skipIfNoSimpleResponder(t)
+
+	const flagSecret = "sk-live-flag-value"
+	const envSecret = "env-secret-value"
+	logBuf := &syncBuffer{}
+	proxyLogger := logmon.NewWriter(logBuf)
+	proxyLogger.SetLogLevel(logmon.LevelDebug)
+	procLogger := logmon.NewWriter(io.Discard)
+
+	cmd, port := simpleResponderCmd(t, "-silent")
+	// CheckEndpoint "none" keeps the unknown flag from failing the start: the
+	// log line is written before the process exits on it.
+	p, err := New(context.Background(), t.Name(), config.ModelConfig{
+		Cmd:           cmd + " --api-key " + flagSecret,
+		Proxy:         fmt.Sprintf("http://127.0.0.1:%d", port),
+		CheckEndpoint: "none",
+		Env:           []string{"HF_TOKEN=" + envSecret},
+	}, procLogger, proxyLogger)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { p.Stop(testStopTimeout) }) //nolint: errcheck
+
+	if err := p.EnsureReady(context.Background(), testStartTimeout); err != nil {
+		t.Fatalf("EnsureReady: %v", err)
+	}
+
+	logged := logBuf.String()
+	if strings.Contains(logged, flagSecret) || strings.Contains(logged, envSecret) {
+		t.Errorf("debug log leaked a secret:\n%s", logged)
+	}
+	if !strings.Contains(logged, "HF_TOKEN") {
+		t.Errorf("debug log dropped the env name:\n%s", logged)
+	}
+}
+
 func TestProcessCommand_StartStop(t *testing.T) {
 	skipIfNoSimpleResponder(t)
 

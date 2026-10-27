@@ -113,6 +113,81 @@ models:
 	}
 }
 
+// A macro is normally named after the tool it wraps and holds a whole command
+// line, so its credential must be caught by the flag rule even though the value
+// has no recognizable token format.
+func TestConfig_RedactedYAML_RedactsMacroSecrets(t *testing.T) {
+	const yml = `
+macros:
+  server: "llama-server --api-key macro-plain-secret"
+  modelpath: "/models/qwen3.gguf"
+models:
+  qwen3:
+    cmd: "${server} --model ${modelpath} --port ${PORT}"
+`
+	cfg, err := LoadConfigFromReader(strings.NewReader(yml))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	out, found, err := cfg.RedactedYAML("macros")
+	if err != nil || !found {
+		t.Fatalf("RedactedYAML: found=%v err=%v", found, err)
+	}
+	if strings.Contains(out, "macro-plain-secret") {
+		t.Errorf("macro secret leaked:\n%s", out)
+	}
+	if !strings.Contains(out, "--api-key "+RedactedPlaceholder) {
+		t.Errorf("macro credential flag not blanked:\n%s", out)
+	}
+	if !strings.Contains(out, "/models/qwen3.gguf") {
+		t.Errorf("harmless macro value was dropped:\n%s", out)
+	}
+}
+
+// Secret keys match a whole word of the key, so allowCredentials and
+// max_tokens stay readable while real credentials are still dropped.
+func TestConfig_RedactedYAML_SecretKeysMatchWholeWords(t *testing.T) {
+	const yml = `
+security:
+  cors:
+    allowedOrigins: ["https://ui.example.com"]
+    allowCredentials: true
+apiKeys: ["front-door-key-value"]
+peers:
+  upstream1:
+    proxy: "http://10.0.0.5:8080"
+    apiKey: "peer-shared-value"
+    models: ["remote-model"]
+models:
+  qwen3:
+    cmd: llama-server --port ${PORT}
+    filters:
+      setParams:
+        max_tokens: 4096
+        token: filter-token-value
+        password: filter-password-value
+`
+	cfg, err := LoadConfigFromReader(strings.NewReader(yml))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	out, _, err := cfg.RedactedYAML("")
+	if err != nil {
+		t.Fatalf("RedactedYAML: %v", err)
+	}
+
+	for _, keep := range []string{"allowCredentials: true", "max_tokens: 4096"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("redacted config lost %q:\n%s", keep, out)
+		}
+	}
+	for _, leak := range []string{"front-door-key-value", "peer-shared-value", "filter-token-value", "filter-password-value"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("redacted config still contains secret %q:\n%s", leak, out)
+		}
+	}
+}
+
 func TestConfig_RedactedYAML_PrunesEmptyDefaults(t *testing.T) {
 	out, _, err := loadRedactFixture(t).RedactedYAML("")
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -11,12 +12,15 @@ import (
 // RedactedPlaceholder replaces every value the redactor removes.
 const RedactedPlaceholder = "[REDACTED]"
 
-// secretKeyHints are substrings matched case-insensitively against a mapping
-// key. A matching value -- and everything nested under it -- is replaced with
-// RedactedPlaceholder. This covers the structured secrets: apiKeys,
-// peers.<id>.apiKey, and any macro or metadata key named like a credential.
-var secretKeyHints = []string{
-	"apikey", "api_key", "token", "secret", "password", "passwd", "credential", "bearer",
+// secretKeyWords are matched against a mapping key and against its last word
+// (apiKey, apiKeys, ...). A matching value, and everything nested under it, is
+// replaced with RedactedPlaceholder. This covers the structured secrets --
+// apiKeys, peers.<id>.apiKey, tailcatKey -- without catching allowCredentials
+// or max_tokens.
+var secretKeyWords = map[string]struct{}{
+	"key": {}, "keys": {}, "apikey": {}, "apikeys": {},
+	"token": {}, "secret": {}, "password": {}, "passwd": {},
+	"credential": {}, "bearer": {},
 }
 
 // secretValuePatterns match well-known credential formats wherever they land --
@@ -51,8 +55,9 @@ var envSecretName = regexp.MustCompile(`(?i)(key|token|secret|password|passwd|cr
 // "models" or "models.qwen3"; found is false when the path does not resolve.
 //
 // Redaction is layered: a value under a credential-named key is dropped whole,
-// cmd/cmdStop strings and env entries have their secret arguments blanked, and
-// any recognizable credential token is scrubbed wherever it appears.
+// cmd/cmdStop strings, macro values and env entries have their secret arguments
+// blanked, and any recognizable credential token is scrubbed wherever it
+// appears.
 func (c Config) RedactedYAML(path string) (out string, found bool, err error) {
 	marshaled, err := yaml.Marshal(c)
 	if err != nil {
@@ -64,9 +69,13 @@ func (c Config) RedactedYAML(path string) (out string, found bool, err error) {
 		return "", false, fmt.Errorf("re-parsing config: %w", err)
 	}
 
-	node := tree
+	// Redaction walks the whole tree so that a subtree keeps the parent key
+	// context it is only meaningful with (the macros block).
+	redacted := redactValue("", tree)
+
+	node := redacted
 	if path != "" {
-		node, found = navigateConfig(tree, strings.Split(path, "."))
+		node, found = navigateConfig(redacted, strings.Split(path, "."))
 		if !found {
 			return "", false, nil
 		}
@@ -76,7 +85,7 @@ func (c Config) RedactedYAML(path string) (out string, found bool, err error) {
 	// that are actually set. Without this even a two-model config expands to
 	// hundreds of lines of empty timeouts/filters/capabilities blocks and blows
 	// past the tool result cap.
-	rendered, _ := pruneEmpty(redactValue("", node))
+	rendered, _ := pruneEmpty(node)
 
 	buf, err := yaml.Marshal(rendered)
 	if err != nil {
@@ -155,7 +164,13 @@ func redactValue(key string, v any) any {
 	case map[string]any:
 		out := make(map[string]any, len(t))
 		for k, val := range t {
-			out[k] = redactValue(k, val)
+			childKey := k
+			// A macro value is held under a user-chosen name, so the parent key
+			// "macros" is what marks it as a command-like string.
+			if strings.EqualFold(key, "macros") {
+				childKey = key
+			}
+			out[k] = redactValue(childKey, val)
 		}
 		return out
 	case []any:
@@ -199,16 +214,27 @@ func redactString(key, s string) string {
 		return "tailcat://" + RedactedPlaceholder
 	}
 	switch strings.ToLower(key) {
-	case "cmd", "cmdstop":
-		for _, re := range cmdSecretPatterns {
-			s = re.ReplaceAllString(s, "${1}"+RedactedPlaceholder)
-		}
+	case "cmd", "cmdstop", "macros":
+		s = redactSecretFlags(s)
 	case "env":
 		if i := strings.IndexByte(s, '='); i > 0 && envSecretName.MatchString(s[:i]) {
 			return s[:i+1] + RedactedPlaceholder
 		}
 	}
 	return scrubTokens(s)
+}
+
+// RedactCommandSecrets blanks credential flag values, inline Authorization
+// headers and recognizable tokens so a command line can be logged or shown.
+func RedactCommandSecrets(cmd string) string {
+	return scrubTokens(redactSecretFlags(cmd))
+}
+
+func redactSecretFlags(s string) string {
+	for _, re := range cmdSecretPatterns {
+		s = re.ReplaceAllString(s, "${1}"+RedactedPlaceholder)
+	}
+	return s
 }
 
 func scrubTokens(s string) string {
@@ -219,14 +245,42 @@ func scrubTokens(s string) string {
 }
 
 func isSecretKey(key string) bool {
-	if key == "" {
+	words := keyWords(key)
+	if len(words) == 0 {
 		return false
 	}
-	lower := strings.ToLower(key)
-	for _, hint := range secretKeyHints {
-		if strings.Contains(lower, hint) {
-			return true
+	if _, secret := secretKeyWords[strings.Join(words, "")]; secret {
+		return true
+	}
+	_, secret := secretKeyWords[words[len(words)-1]]
+	return secret
+}
+
+// keyWords splits a mapping key on separators and camelCase boundaries.
+func keyWords(key string) []string {
+	var (
+		words   []string
+		current []rune
+	)
+	flush := func() {
+		if len(current) > 0 {
+			words = append(words, strings.ToLower(string(current)))
+			current = current[:0]
 		}
 	}
-	return false
+	var prev rune
+	for _, r := range key {
+		switch {
+		case r == '_' || r == '-' || r == '.' || r == '?' || r == ' ':
+			flush()
+		case unicode.IsUpper(r) && (unicode.IsLower(prev) || unicode.IsDigit(prev)):
+			flush()
+			current = append(current, r)
+		default:
+			current = append(current, r)
+		}
+		prev = r
+	}
+	flush()
+	return words
 }
