@@ -21,6 +21,7 @@ import {
   tailcatStatus,
   uiConfig,
   helpAgentEnabled,
+  unloadAllModels,
 } from "./api";
 
 afterEach(() => {
@@ -50,6 +51,17 @@ describe("tailcat api", () => {
     expect(fetch).toHaveBeenCalledWith(
       "/api/metrics/activity?page=2&limit=10&sort=src&order=asc&src_prefix=tc%3A"
     );
+  });
+});
+
+describe("unload api", () => {
+  it("unloads all models with POST", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("OK"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await unloadAllModels();
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/models/unload", { method: "POST" });
   });
 });
 

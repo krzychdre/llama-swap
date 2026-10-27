@@ -4,6 +4,8 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import remarkRehype from "remark-rehype";
 import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema, type Options as SanitizeSchema } from "rehype-sanitize";
 import rehypeStringify from "rehype-stringify";
 // Scoped here (rather than in the global stylesheet) so it ships with this
 // module's chunk instead of loading on every page.
@@ -137,7 +139,123 @@ export function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (char) => htmlEntities[char]);
 }
 
-// Create the unified processor
+// MathML elements katex emits next to its visual HTML copy.
+const katexMathmlTags = [
+  "math",
+  "semantics",
+  "annotation",
+  "mrow",
+  "mi",
+  "mo",
+  "mn",
+  "ms",
+  "mtext",
+  "mspace",
+  "msup",
+  "msub",
+  "msubsup",
+  "mfrac",
+  "msqrt",
+  "mroot",
+  "mover",
+  "munder",
+  "munderover",
+  "mtable",
+  "mtr",
+  "mtd",
+  "mstyle",
+  "mpadded",
+  "mphantom",
+  "menclose",
+  "mmultiscripts",
+  "mprescripts",
+];
+
+const katexMathmlAttributes = [
+  "className",
+  "encoding",
+  "xmlns",
+  "display",
+  "mathvariant",
+  "fence",
+  "stretchy",
+  "symmetric",
+  "minsize",
+  "maxsize",
+  "linethickness",
+  "rowspacing",
+  "rowlines",
+  "columnalign",
+  "columnlines",
+  "columnspacing",
+  "displaystyle",
+  "scriptlevel",
+  "accent",
+  "accentunder",
+  "notation",
+  "width",
+  "height",
+  "voffset",
+  "lspace",
+  "rspace",
+  "depth",
+  "mathcolor",
+  "mathbackground",
+];
+
+// The only CSS properties katex writes inline, with values such as
+// "0.8141em", "-3.063em", "#cc0000", "relative" and
+// "calc(100% - 0.1111em)".
+const katexStyleProperties = [
+  "background-color",
+  "border-bottom-width",
+  "border-right-style",
+  "border-right-width",
+  "border-style",
+  "border-top-width",
+  "border-width",
+  "bottom",
+  "color",
+  "height",
+  "left",
+  "margin",
+  "margin-left",
+  "margin-right",
+  "min-width",
+  "padding-left",
+  "position",
+  "text-shadow",
+  "top",
+  "vertical-align",
+  "width",
+];
+
+const katexStyleDeclaration = `(?:${katexStyleProperties.join("|")}):(?:[-0-9.a-z%# ]+|calc\\([-0-9.a-z% ]+\\));?`;
+
+const katexStyle = new RegExp(`^(?:${katexStyleDeclaration})+$`);
+
+// Model output is rendered with {@html}, so the default schema is only
+// relaxed for what syntax highlighting and katex produce.
+const sanitizeSchema: SanitizeSchema = {
+  ...defaultSchema,
+  tagNames: [...(defaultSchema.tagNames ?? []), ...katexMathmlTags, "svg", "path", "line"],
+  attributes: {
+    ...defaultSchema.attributes,
+    code: ["className"],
+    div: [...(defaultSchema.attributes?.div ?? []), "className"],
+    pre: ["className"],
+    span: ["className", "ariaHidden", ["style", katexStyle]],
+    svg: ["xmlns", "width", "height", "viewBox", "preserveAspectRatio", ["style", katexStyle]],
+    path: ["d"],
+    line: ["x1", "y1", "x2", "y2", "strokeWidth"],
+    ...Object.fromEntries(
+      katexMathmlTags.map((tag) => [tag, [...katexMathmlAttributes, ["style", katexStyle]]]),
+    ),
+  },
+};
+
+// rehypeRaw turns the raw HTML from the model and from rehypeHighlight into
+// nodes, so the sanitizer can inspect them.
 const processor = unified()
   .use(remarkParse)
   .use(remarkGfm)
@@ -145,6 +263,8 @@ const processor = unified()
   .use(remarkRehype, { allowDangerousHtml: true })
   .use(rehypeKatex)
   .use(rehypeHighlight)
+  .use(rehypeRaw)
+  .use(rehypeSanitize, sanitizeSchema)
   .use(rehypeStringify, { allowDangerousHtml: true });
 
 export function splitCompleteBlocks(text: string): { complete: string; pending: string } {
