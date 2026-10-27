@@ -37,6 +37,28 @@ describe("renderMarkdown", () => {
     });
   });
 
+  describe("sanitizing model output", () => {
+    it("strips event handlers from raw HTML", () => {
+      const result = renderMarkdown("<img src=x onerror=alert(1)>");
+      expect(result).toContain('<img src="x">');
+      expect(result).not.toContain("onerror");
+    });
+
+    it("drops unsafe link protocols", () => {
+      expect(renderMarkdown("[click](javascript:alert(1))")).not.toContain("javascript:");
+    });
+
+    it("keeps highlight.js classes on fenced code", () => {
+      expect(renderMarkdown("```go\nfunc main() {}\n```")).toContain('<code class="hljs language-go">');
+    });
+
+    it("keeps the katex HTML and MathML output", () => {
+      const result = renderMarkdown("$$x^2$$");
+      expect(result).toContain("katex");
+      expect(result).toContain("<math");
+    });
+  });
+
   describe("KaTeX math rendering", () => {
     it("renders inline math with $...$ syntax", () => {
       const result = renderMarkdown("The equation $E = mc^2$ is famous.");
