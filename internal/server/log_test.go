@@ -126,28 +126,34 @@ func TestServer_HandleLogs_HTMLRedirect(t *testing.T) {
 
 func TestServer_ClientIP(t *testing.T) {
 	cases := []struct {
-		name  string
-		setup func(*http.Request)
-		want  string
+		name       string
+		remoteAddr string
+		setup      func(*http.Request)
+		want       string
 	}{
-		{"remote addr", func(r *http.Request) { r.RemoteAddr = "10.0.0.5:1234" }, "10.0.0.5"},
-		{"x-forwarded-for", func(r *http.Request) {
+		{"remote addr", "10.0.0.5:1234", func(*http.Request) {}, "10.0.0.5"},
+		{"x-forwarded-for from a loopback proxy", "127.0.0.1:5000", func(r *http.Request) {
 			r.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
 		}, "1.2.3.4"},
-		{"x-real-ip", func(r *http.Request) { r.Header.Set("X-Real-IP", "9.9.9.9") }, "9.9.9.9"},
-		{"x-forwarded-for whitespace-only first entry falls back to x-real-ip", func(r *http.Request) {
+		{"x-real-ip from a loopback proxy", "127.0.0.1:5000", func(r *http.Request) {
+			r.Header.Set("X-Real-IP", "9.9.9.9")
+		}, "9.9.9.9"},
+		{"x-forwarded-for whitespace-only first entry falls back to x-real-ip", "127.0.0.1:5000", func(r *http.Request) {
 			r.Header.Set("X-Forwarded-For", "   , 5.6.7.8")
 			r.Header.Set("X-Real-IP", "9.9.9.9")
 		}, "9.9.9.9"},
-		{"x-forwarded-for empty first entry falls back to remote addr", func(r *http.Request) {
+		{"x-forwarded-for empty first entry falls back to remote addr", "127.0.0.1:5000", func(r *http.Request) {
 			r.Header.Set("X-Forwarded-For", ",5.6.7.8")
-			r.RemoteAddr = "10.0.0.9:1234"
+		}, "127.0.0.1"},
+		{"headers forged by a remote client are ignored", "10.0.0.9:1234", func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", "1.2.3.4")
+			r.Header.Set("X-Real-IP", "9.9.9.9")
 		}, "10.0.0.9"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodGet, "/", nil)
-			r.RemoteAddr = ""
+			r.RemoteAddr = c.remoteAddr
 			c.setup(r)
 			if got := clientIP(r); got != c.want {
 				t.Errorf("clientIP() = %q, want %q", got, c.want)

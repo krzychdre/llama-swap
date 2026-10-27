@@ -25,6 +25,34 @@ require() {
     echo "$_MISSING"
 }
 
+# accepts host:port and :port (every interface); rejects anything that could
+# add a line to the unit file
+validate_address() {
+    _HOST=${1%:*}
+    _PORT=${1##*:}
+    case "$_HOST" in *[!A-Za-z0-9.:\[\]-]*) return 1 ;; esac
+    case "$_PORT" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$_PORT" -ge 1 ] && [ "$_PORT" -le 65535 ]
+}
+validate_address "$LLAMA_SWAP_DEFAULT_ADDRESS" ||
+    error "LLAMA_SWAP_DEFAULT_ADDRESS must be host:port, got '$LLAMA_SWAP_DEFAULT_ADDRESS'"
+
+if available sha256sum; then
+    sha256() { sha256sum "$1" | cut -d' ' -f1; }
+elif available shasum; then
+    sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+    error "This script requires sha256sum or shasum."
+fi
+
+TMPDIR=
+cleanup() {
+    if [ -n "$TMPDIR" ]; then
+        rm -rf "$TMPDIR"
+    fi
+}
+trap cleanup EXIT
+
 SUDO=
 if [ "$(id -u)" -ne 0 ]; then
     if ! available sudo; then
@@ -34,7 +62,7 @@ if [ "$(id -u)" -ne 0 ]; then
     SUDO="sudo"
 fi
 
-NEEDS=$(require tee tar python3 mktemp)
+NEEDS=$(require tee tar python3 mktemp install)
 if [ -n "$NEEDS" ]; then
     status "ERROR: The following tools are required but missing:"
     for NEED in $NEEDS; do
@@ -62,42 +90,50 @@ case "$KERN" in
 esac
 
 download_binary() {
-    ASSET_NAME="linux_$ARCH"
-
     TMPDIR=$(mktemp -d)
-    trap 'rm -rf "${TMPDIR}"' EXIT INT TERM HUP
     PYTHON_SCRIPT=$(cat <<EOF
 import os
 import json
 import sys
 import urllib.request
 
-ASSET_NAME = "${ASSET_NAME}"
+ARCH = "${ARCH}"
+TMPDIR = "${TMPDIR}"
 
 with urllib.request.urlopen("https://api.github.com/repos/mostlygeek/llama-swap/releases/latest") as resp:
     data = json.load(resp)
-    for asset in data.get("assets", []):
-        if ASSET_NAME in asset.get("name", ""):
-            url = asset["browser_download_url"]
-            break
-    else:
-        print("ERROR: Matching asset not found.", file=sys.stderr)
-        exit(1)
 
-print("Downloading:", url, file=sys.stderr)
-output_path = os.path.join("${TMPDIR}", "llama-swap.tar.gz")
-urllib.request.urlretrieve(url, output_path)
-print(output_path)
+version = data["tag_name"].lstrip("v")
+tarball = "llama-swap_%s_linux_%s.tar.gz" % (version, ARCH)
+checksums = "llama-swap_%s_checksums.txt" % version
+urls = {asset["name"]: asset["browser_download_url"] for asset in data.get("assets", [])}
+
+for name in (tarball, checksums):
+    if name not in urls:
+        print("ERROR: %s not found in the latest release." % name, file=sys.stderr)
+        exit(1)
+    print("Downloading:", urls[name], file=sys.stderr)
+    urllib.request.urlretrieve(urls[name], os.path.join(TMPDIR, name))
+
+print(tarball)
 EOF
 )
 
-    TARFILE=$(python3 -c "$PYTHON_SCRIPT")
+    ASSET_NAME=$(python3 -c "$PYTHON_SCRIPT")
+    TARFILE="$TMPDIR/$ASSET_NAME"
     if [ ! -f "$TARFILE" ]; then
         error "Failed to download binary."
     fi
 
-    status "Extracting to /usr/local/bin"
-    $SUDO tar -xzf "$TARFILE" -C /usr/local/bin llama-swap
+    EXPECTED=$(grep " $ASSET_NAME\$" "$TMPDIR"/*_checksums.txt | cut -d' ' -f1) || true
+    ACTUAL=$(sha256 "$TARFILE")
+    if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+        error "Checksum mismatch for $ASSET_NAME (expected '$EXPECTED', got '$ACTUAL')."
+    fi
+
+    status "Installing /usr/local/bin/llama-swap"
+    tar -xzf "$TARFILE" -C "$TMPDIR" llama-swap
+    $SUDO install -m 0755 "$TMPDIR/llama-swap" /usr/local/bin/llama-swap
 }
 download_binary
 
@@ -180,7 +216,7 @@ EOF
             $SUDO systemctl enable llama-swap
 
             start_service() { $SUDO systemctl restart llama-swap; }
-            trap start_service EXIT
+            trap 'start_service; cleanup' EXIT
             ;;
         *)
             warning "systemd is not running"

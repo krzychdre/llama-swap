@@ -28,6 +28,16 @@ func serve(p *proxyServer, method, path string) *httptest.ResponseRecorder {
 	return rec
 }
 
+func serveWithHeaders(p *proxyServer, method, path string, headers map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, nil)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	return rec
+}
+
 func TestProxy_RequireConfirmRootShowsConfirmPage(t *testing.T) {
 	p := newTestProxy(t, true)
 	for _, path := range []string{"/", "/ui/"} {
@@ -95,6 +105,39 @@ func TestProxy_RequireConfirmWakeRedirectsWhenReady(t *testing.T) {
 	rec := serve(p, "POST", wakePath)
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("got status %d, want %d", rec.Code, http.StatusSeeOther)
+	}
+}
+
+func TestProxy_WakeOnlyFromOwnOrigin(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    int
+	}{
+		{"same-origin fetch", map[string]string{"Sec-Fetch-Site": "same-origin"}, http.StatusSeeOther},
+		{"user typed the url", map[string]string{"Sec-Fetch-Site": "none"}, http.StatusSeeOther},
+		{"form post without browser headers", nil, http.StatusSeeOther},
+		{"origin matches host", map[string]string{"Origin": "http://example.com"}, http.StatusSeeOther},
+		{"referer matches host", map[string]string{"Referer": "http://example.com/"}, http.StatusSeeOther},
+		{"foreign origin", map[string]string{"Origin": "http://evil.example"}, http.StatusForbidden},
+		{"foreign referer", map[string]string{"Referer": "http://evil.example/page"}, http.StatusForbidden},
+		{"cross-site fetch", map[string]string{"Sec-Fetch-Site": "cross-site"}, http.StatusForbidden},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newTestProxy(t, true)
+
+			rec := serveWithHeaders(p, "POST", wakePath, tc.headers)
+			if rec.Code != tc.want {
+				t.Fatalf("got status %d, want %d", rec.Code, tc.want)
+			}
+
+			// a rejected request must not have started a wake
+			if woke := p.wakePending(); woke != (tc.want == http.StatusSeeOther) {
+				t.Fatalf("wake pending = %v with status %d", woke, tc.want)
+			}
+		})
 	}
 }
 

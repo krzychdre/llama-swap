@@ -313,6 +313,10 @@ func (r *Peer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	// The client's own llama-swap key must never reach the peer, so both
+	// credential headers start from the peer's configuration alone.
+	req.Header.Del("Authorization")
+	req.Header.Del("x-api-key")
 	if pp.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+pp.apiKey)
 		req.Header.Set("x-api-key", pp.apiKey)

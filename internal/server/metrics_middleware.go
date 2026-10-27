@@ -83,7 +83,12 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 			var reqBody []byte
 			var reqHeaders map[string]string
 			if r.Body != nil && (isJSON || (mm.enableCaptures && cf&captureReqBody != 0)) {
-				if buffered, err := io.ReadAll(r.Body); err == nil {
+				buffered, err := io.ReadAll(r.Body)
+				if bodyErr := bodyTooLargeFrom(err); bodyErr != nil {
+					swaputil.SendResponse(w, r, bodyErr.status, bodyErr.message)
+					return
+				}
+				if err == nil {
 					reqBody = buffered
 					r.Body.Close()
 					r.Body = io.NopCloser(bytes.NewReader(reqBody))

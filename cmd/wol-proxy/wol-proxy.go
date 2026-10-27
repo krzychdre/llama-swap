@@ -36,7 +36,7 @@ const maxTrackedWake = 10 * time.Minute
 var (
 	flagMac      = flag.String("mac", "", "mac address to send WoL packet to")
 	flagUpstream = flag.String("upstream", "", "upstream proxy address to send requests to")
-	flagListen   = flag.String("listen", ":8080", "listen address to listen on")
+	flagListen   = flag.String("listen", "127.0.0.1:8080", "listen address to listen on")
 	flagLog      = flag.String("log", "info", "log level (debug, info, warn, error)")
 	flagTimeout  = flag.Int("timeout", 60, "seconds requests wait for upstream response before failing")
 	flagAPIKey   = flag.String("api-key", "", "API key sent as Bearer token to the upstream SSE endpoint (falls back to LLAMA_SWAP_API_KEY env var)")
@@ -368,10 +368,43 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.upstreamProxy.ServeHTTP(w, r)
 }
 
+// wakeAllowed reports whether a wake request comes from the page wol-proxy
+// served rather than from a cross-origin page open in the same browser
+func wakeAllowed(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "same-origin", "none":
+		return true
+	case "":
+		// not sent by a browser
+	default:
+		return false
+	}
+
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		origin = r.Header.Get("Referer")
+	}
+	if origin == "" {
+		return true // a non-browser client such as curl
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return u.Host == r.Host
+}
+
 // handleWake sends the WoL packet after the user confirmed on the confirmation
 // page. It redirects to a GET page so the browser never has to re-submit the
 // form when the loading page reloads itself.
 func (p *proxyServer) handleWake(w http.ResponseWriter, r *http.Request) {
+	if !wakeAllowed(r) {
+		slog.Warn("rejected cross-origin wake request", "from", r.RemoteAddr, "origin", r.Header.Get("Origin"))
+		http.Error(w, "cross-origin wake request", http.StatusForbidden)
+		return
+	}
+
 	if p.getStatus() == ready {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return

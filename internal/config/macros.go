@@ -17,6 +17,19 @@ var (
 	envMacroRegex     = regexp.MustCompile(`\$\{env\.([a-zA-Z_][a-zA-Z0-9_]*)\}`)
 )
 
+// macroExpansionLimit bounds the resolved macro values in one scope, so a
+// chain such as m1: ${m0}${m0}, m2: ${m1}${m1} fails to load instead of
+// materialising 2^n copies of a value.
+const macroExpansionLimit = 4 << 20
+
+// resolvedMacro carries a macro's value twice: value for a whole-placeholder
+// replacement, which keeps the declared scalar type, and text for expanding the
+// placeholder inside a longer string.
+type resolvedMacro struct {
+	value any
+	text  string
+}
+
 type modelMacroConfig struct {
 	Macros MacroList `yaml:"macros"`
 }
@@ -130,13 +143,18 @@ func resolveConfigMacros(yamlStr string) (map[string]any, configMacroConfig, err
 		models[modelID] = model
 	}
 
+	resolvedGlobals, err := resolveMacros(declarations.Macros)
+	if err != nil {
+		return nil, configMacroConfig{}, err
+	}
+
 	// Global macros apply to every top-level configuration value except models,
 	// which also need their model-local macro scope.
 	for key, value := range raw {
 		if key == "models" {
 			continue
 		}
-		raw[key] = substituteMacroList(value, declarations.Macros)
+		raw[key] = substituteMacros(value, resolvedGlobals)
 	}
 
 	// startPort may itself contain a global macro, so read it only after the
@@ -161,13 +179,16 @@ func resolveConfigMacros(yamlStr string) (map[string]any, configMacroConfig, err
 		}
 
 		// mergeModelMacros adds MODEL_ID, overlays model definitions on globals,
-		// and preserves declaration order. The recursive substitution then
-		// covers every model value; setParamsByID keys are handled separately
-		// because ordinary mapping keys are intentionally not macro targets.
+		// and preserves declaration order. The substitution then covers every
+		// model value; setParamsByID keys are handled separately because
+		// ordinary mapping keys are intentionally not macro targets.
 		macros := mergeModelMacros(modelID, declarations.Macros, declarations.Models[modelID].Macros)
-		resolved := substituteMacroList(model, macros)
-		model = resolved.(map[string]any)
-		if err := substituteSetParamsByIDKeys(model, macros); err != nil {
+		resolved, err := resolveMacros(macros)
+		if err != nil {
+			return nil, configMacroConfig{}, fmt.Errorf("model %s: %w", modelID, err)
+		}
+		model = substituteMacros(model, resolved).(map[string]any)
+		if err := substituteSetParamsByIDKeys(model, resolved); err != nil {
 			return nil, configMacroConfig{}, fmt.Errorf("model %s filters.setParamsByID: %w", modelID, err)
 		}
 
@@ -183,10 +204,12 @@ func resolveConfigMacros(yamlStr string) (map[string]any, configMacroConfig, err
 				return nil, configMacroConfig{}, fmt.Errorf("model %s: proxy uses ${PORT} but cmd does not - ${PORT} is only available when used in cmd", modelID)
 			}
 
-			portMacro := MacroList{{Name: "PORT", Value: nextPort}}
-			resolved = substituteMacroList(model, portMacro)
-			model = resolved.(map[string]any)
-			if err := substituteSetParamsByIDKeys(model, portMacro); err != nil {
+			portResolved, err := resolveMacros(MacroList{{Name: "PORT", Value: nextPort}})
+			if err != nil {
+				return nil, configMacroConfig{}, fmt.Errorf("model %s: %w", modelID, err)
+			}
+			model = substituteMacros(model, portResolved).(map[string]any)
+			if err := substituteSetParamsByIDKeys(model, portResolved); err != nil {
 				return nil, configMacroConfig{}, fmt.Errorf("model %s filters.setParamsByID: %w", modelID, err)
 			}
 			nextPort++
@@ -254,14 +277,80 @@ func mergeModelMacros(modelID string, global, model MacroList) MacroList {
 	return merged
 }
 
-func substituteMacroList(resolved any, macros MacroList) any {
-	for i := len(macros) - 1; i >= 0; i-- {
-		resolved = substituteMacroInValue(resolved, macros[i].Name, macros[i].Value)
+// resolveMacros expands each macro value once, in declaration order, so a value
+// may reference macros declared before it. A reference to a later macro stays
+// literal and is reported by validateConfigMacroUses. Expansion is therefore
+// linear in the declaration count, with macroExpansionLimit as the hard stop.
+func resolveMacros(macros MacroList) (map[string]resolvedMacro, error) {
+	resolved := make(map[string]resolvedMacro, len(macros))
+	total := 0
+	for _, entry := range macros {
+		text, ok := entry.Value.(string)
+		if !ok {
+			resolved[entry.Name] = resolvedMacro{value: entry.Value, text: fmt.Sprintf("%v", entry.Value)}
+			continue
+		}
+		text = expandMacroText(text, resolved)
+		total += len(text)
+		if total > macroExpansionLimit {
+			return nil, fmt.Errorf("macro expansion exceeded %d bytes", macroExpansionLimit)
+		}
+		resolved[entry.Name] = resolvedMacro{value: text, text: text}
 	}
-	return resolved
+	return resolved, nil
 }
 
-func substituteSetParamsByIDKeys(model map[string]any, macros MacroList) error {
+// substituteMacros replaces every resolved placeholder in a value structure. A
+// string that is exactly one placeholder takes the macro's typed value, so an
+// integer or boolean macro reaches the typed Config as that type.
+func substituteMacros(value any, resolved map[string]resolvedMacro) any {
+	switch v := value.(type) {
+	case string:
+		if name, ok := macroPlaceholder(v); ok {
+			if macro, found := resolved[name]; found {
+				return macro.value
+			}
+			return v
+		}
+		return expandMacroText(v, resolved)
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, val := range v {
+			out[key] = substituteMacros(val, resolved)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, val := range v {
+			out[i] = substituteMacros(val, resolved)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func macroPlaceholder(s string) (string, bool) {
+	if !strings.HasPrefix(s, "${") || !strings.HasSuffix(s, "}") {
+		return "", false
+	}
+	name := s[2 : len(s)-1]
+	if !macroNameRegex.MatchString(name) {
+		return "", false
+	}
+	return name, true
+}
+
+func expandMacroText(s string, resolved map[string]resolvedMacro) string {
+	return macroPatternRegex.ReplaceAllStringFunc(s, func(match string) string {
+		if macro, found := resolved[match[2:len(match)-1]]; found {
+			return macro.text
+		}
+		return match
+	})
+}
+
+func substituteSetParamsByIDKeys(model map[string]any, macros map[string]resolvedMacro) error {
 	filters, ok := model["filters"].(map[string]any)
 	if !ok {
 		return nil
@@ -273,11 +362,7 @@ func substituteSetParamsByIDKeys(model map[string]any, macros MacroList) error {
 
 	resolved := make(map[string]any, len(params))
 	for key, value := range params {
-		newKey := key
-		for i := len(macros) - 1; i >= 0; i-- {
-			entry := macros[i]
-			newKey = strings.ReplaceAll(newKey, fmt.Sprintf("${%s}", entry.Name), fmt.Sprintf("%v", entry.Value))
-		}
+		newKey := expandMacroText(key, macros)
 		if _, exists := resolved[newKey]; exists {
 			return fmt.Errorf("keys %q and %q resolve to the same value", key, newKey)
 		}
@@ -408,45 +493,6 @@ func validateMacroUses(value any, path, modelID, fieldPath string, allowPID bool
 	default:
 		// Scalar types don't contain macros
 		return nil
-	}
-}
-
-// substituteMacroInValue recursively substitutes a single macro in a value structure
-func substituteMacroInValue(value any, macroName string, macroValue any) any {
-	macroSlug := fmt.Sprintf("${%s}", macroName)
-	macroStr := fmt.Sprintf("%v", macroValue)
-
-	switch v := value.(type) {
-	case string:
-		// Check if this is a direct macro substitution
-		if v == macroSlug {
-			return macroValue
-		}
-		// Handle string interpolation
-		if strings.Contains(v, macroSlug) {
-			return strings.ReplaceAll(v, macroSlug, macroStr)
-		}
-		return v
-
-	case map[string]any:
-		// Recursively process map values
-		newMap := make(map[string]any)
-		for key, val := range v {
-			newMap[key] = substituteMacroInValue(val, macroName, macroValue)
-		}
-		return newMap
-
-	case []any:
-		// Recursively process slice elements
-		newSlice := make([]any, len(v))
-		for i, val := range v {
-			newSlice[i] = substituteMacroInValue(val, macroName, macroValue)
-		}
-		return newSlice
-
-	default:
-		// Return scalar types as-is
-		return value
 	}
 }
 

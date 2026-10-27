@@ -18,15 +18,15 @@ go build -o wol-proxy ./cmd/wol-proxy
 wol-proxy runs on an always-on machine on the same LAN as the llama-swap server. Point clients at wol-proxy instead of llama-swap.
 
 ```shell
-# minimal
+# minimal, listens on 127.0.0.1:8080
 $ ./wol-proxy -mac BA:DC:0F:FE:E0:00 -upstream http://192.168.1.13:8080
 
 # everything
 $ ./wol-proxy -mac BA:DC:0F:FE:E0:00 -upstream http://192.168.1.13:8080 \
     # use debug log level
     -log debug \
-    # altenerative listening port
-    -listen localhost:9999 \
+    # alternative listening port, reachable from the network
+    -listen :9999 \
     # seconds to hold requests waiting for upstream to be ready
     -timeout 30 \
     # API key sent as Bearer token to the upstream SSE endpoint
@@ -38,6 +38,7 @@ $ ./wol-proxy -mac BA:DC:0F:FE:E0:00 -upstream http://192.168.1.13:8080 \
 
 ## How it works
 
+- `-listen` defaults to `127.0.0.1:8080`, so only the machine running wol-proxy reaches it. `-listen :8080` binds every interface and publishes the whole upstream API, including `/unload`, to the network; wol-proxy adds no authentication of its own.
 - wol-proxy keeps an SSE connection open to the upstream's `/api/events`. While it is connected the upstream is "ready". If it fails or closes, the upstream is "not ready" and wol-proxy retries with a growing delay (up to 10 seconds).
 - Every 10 seconds it also requests the upstream's `/wol-health`. If that gets no response within 5 seconds (for example the machine suspended without closing the connection), the upstream is marked not ready.
 - A request that arrives while the upstream is not ready sends a Wake-on-LAN packet (UDP broadcast to port 9) and waits for the upstream to become ready. Requests to `/api/events` do not wake the server.
@@ -50,6 +51,7 @@ By default any request wakes the server. With `-require-confirm`, nothing is sen
 
 - Browser requests to `/` and `/ui/` show a page with a "Start server" button. Pressing it sends the WoL packet and shows the loading page until the server is ready.
 - All other requests (e.g. API calls) fail immediately with `503 Service Unavailable` and no WoL packet is sent.
+- The button's `POST /wol-wake` is accepted only from wol-proxy's own pages: when the browser sends `Sec-Fetch-Site` it must be `same-origin` or `none`, and otherwise `Origin`/`Referer` must match the address wol-proxy was reached on. A request from a page on another site gets `403 Forbidden` and no packet is sent.
 
 ## Loading page
 

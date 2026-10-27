@@ -180,6 +180,17 @@ func New(
 
 func (p *ProcessCommand) Logger() *logmon.Monitor { return p.processLogger }
 
+// envNames drops the values from NAME=VALUE env entries, so a debug line cannot
+// copy an upstream API key into the log buffer served by /logs.
+func envNames(env []string) string {
+	names := make([]string, len(env))
+	for i, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
+		names[i] = name
+	}
+	return strings.Join(names, ", ")
+}
+
 // run is the single-writer goroutine that owns all mutable lifecycle state
 // (current ProcessState, the running *exec.Cmd, the active reverse-proxy
 // handler, and the list of WaitReady subscribers). Every public method
@@ -683,12 +694,13 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	cmd.WaitDelay = p.waitDelay
 	setProcAttributes(cmd)
 
-	p.proxyLogger.Debugf("<%s> Executing start command: %s, env: %s", p.id, strings.Join(args, " "), strings.Join(p.config.Env, ", "))
+	p.proxyLogger.Debugf("<%s> Executing start command: %s, env: %s", p.id,
+		config.RedactCommandSecrets(strings.Join(args, " ")), envNames(p.config.Env))
 
 	cmdDone := make(chan struct{})
 	if err := cmd.Start(); err != nil {
 		cmdCancel()
-		return startResult{err: fmt.Errorf("failed to start command '%s': %w", strings.Join(args, " "), err)}
+		return startResult{err: fmt.Errorf("failed to start command %q: %w", args[0], err)}
 	}
 
 	go func() {

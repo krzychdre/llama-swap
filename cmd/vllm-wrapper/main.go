@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -57,7 +58,7 @@ func serveCmd(args []string) {
 	)
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	fs.StringVar(&vllmURL, "vllm-url", "", "Base URL of vLLM server (e.g., http://127.0.0.1:8000)")
-	fs.StringVar(&listenAddr, "listen", "", "Address to listen on (e.g., :$PORT)")
+	fs.StringVar(&listenAddr, "listen", "", "Address to listen on (e.g., 127.0.0.1:$PORT)")
 	fs.IntVar(&sleepLevel, "sleep-level", 1, "Sleep level to use when sleeping (default 1)")
 	fs.StringVar(&healthPath, "health-path", "/health", "Health check path (default /health)")
 	fs.DurationVar(&waitTimeout, "wait-timeout", 120*time.Second, "Timeout waiting for daemon to become healthy")
@@ -137,10 +138,8 @@ func serveCmd(args []string) {
 
 	// Create HTTP server.
 	srv := &http.Server{
-		Addr: listenAddr,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			proxy.ServeHTTP(w, r)
-		}),
+		Addr:    listenAddr,
+		Handler: newServeHandler(proxy),
 	}
 
 	// Start server in a goroutine.
@@ -173,6 +172,32 @@ func serveCmd(args []string) {
 		log.Fatalf("Server shutdown failed: %v", err)
 	}
 	log.Println("Server stopped")
+}
+
+// newServeHandler wraps the vLLM proxy and refuses the sleep control endpoints
+// for clients that are not on this machine
+func newServeHandler(proxy http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && isControlPath(r.URL.Path) && !isLoopbackClient(r.RemoteAddr) {
+			http.Error(w, "control endpoint is loopback only", http.StatusForbidden)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	})
+}
+
+func isControlPath(path string) bool {
+	return path == "/sleep" || path == "/wake_up"
+}
+
+// isLoopbackClient reports whether remoteAddr is a loopback peer
+func isLoopbackClient(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // sleepCmd implements the sleep subcommand.

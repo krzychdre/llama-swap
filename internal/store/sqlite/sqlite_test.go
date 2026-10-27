@@ -2,7 +2,9 @@ package sqlite
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -428,6 +430,28 @@ func TestStore_NewFilePersistsActivity(t *testing.T) {
 	}
 	if stats.TotalRequests != 1 {
 		t.Fatalf("total requests = %d, want 1", stats.TotalRequests)
+	}
+}
+
+// The activity rows carry request paths, metadata and error messages, so the
+// database file must not be readable by other users.
+func TestStore_NewFileIsOwnerOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no POSIX file modes on Windows")
+	}
+	path := filepath.Join(t.TempDir(), "llama-swap.sqlite")
+	st, err := New(path)
+	if err != nil {
+		t.Fatalf("New file store: %v", err)
+	}
+	defer st.Close()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("file mode = %v, want 0600", perm)
 	}
 }
 

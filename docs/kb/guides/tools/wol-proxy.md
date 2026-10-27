@@ -3,7 +3,7 @@ title: Wake a suspended llama-swap server with wol-proxy
 summary: wol-proxy sits in front of llama-swap, sends a Wake-on-LAN packet when a request arrives and the server is asleep, and holds the request until the server is back.
 category: guides
 tags: [wol-proxy, wake-on-lan, wol, suspend, power, energy, tools]
-updated: 2026-10-23
+updated: 2026-10-27
 ---
 
 # Wake a suspended llama-swap server with wol-proxy
@@ -30,11 +30,15 @@ go build -o wol-proxy ./cmd/wol-proxy
 | --- | --- | --- |
 | `-mac` | required | MAC address of the llama-swap machine |
 | `-upstream` | required | llama-swap URL |
-| `-listen` | `:8080` | where wol-proxy listens |
+| `-listen` | `127.0.0.1:8080` | where wol-proxy listens |
 | `-timeout` | `60` | seconds a request waits for the server before failing with `408` |
 | `-api-key` | none | key for llama-swap's `apiKeys`; also read from `LLAMA_SWAP_API_KEY` |
 | `-require-confirm` | off | ask before waking (below) |
 | `-log` | `info` | `debug`, `info`, `warn` or `error` |
+
+The default listens on loopback only. `-listen :8080` binds every interface,
+which publishes the whole upstream API to the network, `/unload` included;
+wol-proxy adds no authentication of its own. Do that only on a trusted LAN.
 
 ## How it knows the server is up
 
@@ -51,6 +55,13 @@ being held. With `-require-confirm`, nothing wakes the server automatically:
 browsers see a "Start server" button, and API calls fail at once with
 `503 Service Unavailable`. Use it if background clients (health monitors, editor
 plugins) would otherwise keep waking the machine.
+
+The button posts to `/wol-wake`, and wol-proxy accepts that post only from its
+own pages. A browser request passes when `Sec-Fetch-Site` is `same-origin` or
+`none`; without that header, `Origin` or `Referer` must match the host
+wol-proxy was reached on. A page on another site that posts to the endpoint
+gets `403 Forbidden` and no packet is sent, so a cross-site form cannot wake the
+machine. Non-browser clients send neither header and are accepted.
 
 ## What goes wrong
 

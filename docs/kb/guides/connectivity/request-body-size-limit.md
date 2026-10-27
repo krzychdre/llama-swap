@@ -4,14 +4,15 @@ summary: Raise maxRequestBodyMB when large audio uploads or base64 images fail w
 category: guides
 tags: [413, request-entity-too-large, chunked, upload, body-size, audio, images, base64, limit]
 config_keys: [maxRequestBodyMB]
-updated: 2026-10-20
+updated: 2026-10-27
 ---
 
 # Request body size limit
 
 `maxRequestBodyMB` caps the size, in megabytes, of a request body sent to a
 model endpoint such as `/v1/chat/completions`, `/v1/embeddings` or
-`/v1/audio/transcriptions`. The default is `250`.
+`/v1/audio/transcriptions`. It applies equally to the same model endpoints
+reached through the `/upstream/<model>/...` passthrough. The default is `250`.
 
 ```yaml
 maxRequestBodyMB: 1024

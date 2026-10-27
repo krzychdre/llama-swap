@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -93,6 +94,38 @@ models:
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "resolve to the same value")
 	})
+}
+
+func TestConfig_MacroChainResolves(t *testing.T) {
+	content := `
+macros:
+  BASE: /models
+  DIR: "${BASE}/llama"
+  FULL: "${DIR}/model.gguf"
+models:
+  model1:
+    cmd: load ${FULL}
+    proxy: http://localhost:8080
+`
+
+	config, err := LoadConfigFromReader(strings.NewReader(content))
+	require.NoError(t, err)
+	assert.Equal(t, "load /models/llama/model.gguf", config.Models["model1"].Cmd)
+}
+
+// Each macro doubling the previous one expands to 2^n bytes, so resolution runs
+// out of size budget instead of memory.
+func TestConfig_MacroChainSizeLimit(t *testing.T) {
+	var macros strings.Builder
+	macros.WriteString("  m0: x\n")
+	for i := 1; i < 30; i++ {
+		fmt.Fprintf(&macros, "  m%d: \"${m%d}${m%d}\"\n", i, i-1, i-1)
+	}
+	content := "macros:\n" + macros.String() + "models:\n  model1:\n    cmd: echo ${m29}\n"
+
+	_, err := LoadConfigFromReader(strings.NewReader(content))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "macro expansion exceeded")
 }
 
 func TestConfig_MacroForwardReferenceRejected(t *testing.T) {

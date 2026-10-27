@@ -48,6 +48,10 @@ func CreateFilterMiddleware(cfg config.Config) chain.Middleware {
 
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
+				if bodyErr := bodyTooLargeFrom(err); bodyErr != nil {
+					swaputil.SendResponse(w, r, bodyErr.status, bodyErr.message)
+					return
+				}
 				swaputil.SendResponse(w, r, http.StatusBadRequest, "could not read request body")
 				return
 			}

@@ -19,6 +19,10 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
+// maxAPIBodyBytes bounds the body of the UI's /api/ requests. Their payloads are
+// small JSON objects, so anything larger is a mistake or an attack.
+const maxAPIBodyBytes = 1 << 20
+
 // apiModel is one entry in the /api/events modelStatus payload.
 type apiModel struct {
 	Id           string         `json:"id"`
@@ -88,6 +92,10 @@ func (s *Server) handleAPIActiveProfile(w http.ResponseWriter, r *http.Request) 
 	var body map[string]json.RawMessage
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&body); err != nil {
+		if bodyErr := bodyTooLargeFrom(err); bodyErr != nil {
+			swaputil.SendResponse(w, r, bodyErr.status, bodyErr.message)
+			return
+		}
 		swaputil.SendResponse(w, r, http.StatusBadRequest, "invalid profile request")
 		return
 	}

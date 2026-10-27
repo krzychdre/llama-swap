@@ -59,8 +59,18 @@ func serveCompressedFile(fsys http.FileSystem, w http.ResponseWriter, r *http.Re
 	return nil
 }
 
+// uiContentSecurityPolicy restricts the embedded UI to its own origin and the
+// inline styles its build emits. The Playground plays generated speech from an
+// object URL, which needs blob: in media-src. It is not added to proxied
+// upstream responses.
+const uiContentSecurityPolicy = "default-src 'self'; script-src 'self'; " +
+	"style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; " +
+	"media-src 'self' blob:; font-src 'self' data:; connect-src 'self'; " +
+	"object-src 'none'; base-uri 'self'"
+
 // handleUI serves the embedded SPA under /ui/.
 func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Security-Policy", uiContentSecurityPolicy)
 	serveUI(uiFS, w, r)
 }
 
