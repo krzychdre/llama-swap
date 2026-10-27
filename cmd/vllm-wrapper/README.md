@@ -47,7 +47,7 @@ models:
     cmd: |
       vllm-wrapper serve
       --vllm-url http://127.0.0.1:8000
-      --listen :${PORT}
+      --listen 127.0.0.1:${PORT}
       --wait-timeout 600s
       --
       ${vllm}
@@ -100,7 +100,7 @@ models:
     cmd: |
       vllm-wrapper serve
       --vllm-url http://127.0.0.1:8000
-      --listen :${PORT}
+      --listen 127.0.0.1:${PORT}
       --
       ${vllm}
       serve
@@ -151,7 +151,7 @@ Use `systemd-run` in the `llama-swap` model command:
 cmd: |
   vllm-wrapper serve
   --vllm-url http://127.0.0.1:18000
-  --listen :${PORT}
+  --listen 127.0.0.1:${PORT}
   --wait-timeout 5m
   --journal-unit vllm-qwen.service
   # optional systemd user unit whose new journal entries are forwarded to the wrapper's stdout, making vLLM logs available through llama-swap's upstream log stream.
@@ -200,6 +200,19 @@ sudo -u llama env \
     -o cat
 ```
 
+## Control endpoints
+
+The proxy forwards everything to vLLM, including the `/sleep` and `/wake_up`
+control endpoints that vLLM serves without authentication. To keep them local,
+a `POST` to either path from a non-loopback client is answered with
+`403 Forbidden` and never reaches vLLM; the check uses the request's
+`RemoteAddr`, so there is nothing to configure. Clients on this machine (llama-swap,
+`vllm-wrapper sleep`) are unaffected.
+
+Bind the proxy to loopback as well (`--listen 127.0.0.1:${PORT}`).
+`--listen :${PORT}` publishes the whole vLLM API, which has no authentication of
+its own.
+
 ## How it works
 
 ### serve subcommand
@@ -207,7 +220,7 @@ sudo -u llama env \
 1. **Health check**: Sends a GET request to `${vllm-url}${health-path}` (default `/health`). If the response is HTTP 200, the daemon is reachable. It may still be asleep, so the wrapper sends it a wake-up request anyway (harmless if it is awake), waits up to 10 seconds for it to be healthy again, and proceeds to step 4.
 2. **Wake up**: If the health check fails (non‑200 or connection error), send a POST request to `${vllm-url}/wake_up`. If the wake‑up succeeds (HTTP 200 or 204), proceed to step 4.
 3. **Start daemon**: If the wake‑up fails (indicating the daemon is not running), use the command specified after `--` (argv-based, launched via `exec.Command`). The wrapper starts the command as a child process, then waits for the daemon to become healthy by polling the health path.
-4. **Reverse proxy**: Once the daemon is healthy, start an HTTP server listening on `${PORT}` (or the address provided to `--listen`) that proxies all requests to the vLLM upstream URL. The proxy preserves streaming responses by setting `X-Accel-Buffering: no`.
+4. **Reverse proxy**: Once the daemon is healthy, start an HTTP server listening on the address provided to `--listen` (normally `127.0.0.1:${PORT}`) that proxies all requests to the vLLM upstream URL. The proxy preserves streaming responses by setting `X-Accel-Buffering: no`, and rejects `POST /sleep` and `POST /wake_up` from non-loopback clients.
 
 ### sleep subcommand
 

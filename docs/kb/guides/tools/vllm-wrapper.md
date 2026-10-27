@@ -4,7 +4,7 @@ summary: vllm-wrapper is used as cmd and cmdStop so llama-swap puts a running vL
 category: guides
 tags: [vllm-wrapper, vllm, sleep-mode, wake-up, vram, swap, tools]
 config_keys: [models.*.cmd, models.*.cmdStop, models.*.proxy, models.*.ttl]
-updated: 2026-10-23
+updated: 2026-10-27
 ---
 
 # Fast vLLM swapping with vllm-wrapper and sleep mode
@@ -36,7 +36,7 @@ models:
     cmd: |
       vllm-wrapper serve
       --vllm-url http://127.0.0.1:8000
-      --listen :${PORT}
+      --listen 127.0.0.1:${PORT}
       --wait-timeout 600s
       --
       vllm serve /models/qwen-7b
@@ -58,7 +58,7 @@ port; two models sharing one would wake the same server.
 | flag | default | meaning |
 | --- | --- | --- |
 | `--vllm-url` | required | base URL of the vLLM server |
-| `--listen` | required | address to proxy on, normally `:${PORT}` |
+| `--listen` | required | address to proxy on, normally `127.0.0.1:${PORT}` |
 | `--wait-timeout` | `120s` | how long to wait for vLLM to become healthy after a cold start |
 | `--health-path` | `/health` | vLLM health endpoint |
 | `--sleep-level` | `1` | level used when `serve` receives SIGTERM |
@@ -72,6 +72,16 @@ port; two models sharing one would wake the same server.
 | `--sleep-level` | `1` | vLLM sleep level sent in the `/sleep` request |
 | `--stop-pid` | none | PID of the `serve` process to stop after vLLM is asleep. Set it to `${PID}`; without it the unload ends in a process-group kill |
 
+## Sleep and wake control endpoints
+
+vLLM's `/sleep` and `/wake_up` are reachable through the wrapper's proxy, so
+they are also protected there: a `POST` to either path from a client that is not
+on the wrapper's own machine gets `403 Forbidden` and never reaches vLLM. This
+check uses the TCP peer address, so it holds without any flag or config. Bind
+the proxy to loopback (`--listen 127.0.0.1:${PORT}`) as well; `--listen :${PORT}`
+publishes the rest of the vLLM API to the network, and that API has no
+authentication.
+
 ## What goes wrong
 
 - **The first swap-in times out.** A cold start loads the model. Raise
@@ -80,6 +90,9 @@ port; two models sharing one would wake the same server.
   with `--enable-sleep-mode`; without it `cmdStop` fails.
 - **VRAM is not freed.** Check vLLM's own logs for the `/sleep` request and its
   result. What a sleep level frees is defined by vLLM, not by vllm-wrapper.
+- **Another machine can put vLLM to sleep.** Only loopback clients are allowed a
+  `POST /sleep` or `POST /wake_up` through the wrapper, everything else gets
+  `403`. If a request from another host is expected, send it to vLLM directly.
 - **vLLM is killed on unload and the next swap-in is a cold start.** llama-swap
   treats the model as stopped when `serve` exits. Without `--stop-pid ${PID}` in
   `cmdStop`, `serve` keeps running; after `unloadTimeout` (default 10s)

@@ -11,7 +11,7 @@ status() { echo ">>> $*" >&2; }
 error() { echo "${red}ERROR:${plain} $*"; exit 1; }
 warning() { echo "${red}WARNING:${plain} $*"; }
 
-available() { command -v $1 >/dev/null; }
+available() { command -v "$1" >/dev/null; }
 
 SUDO=
 if [ "$(id -u)" -ne 0 ]; then
@@ -33,9 +33,9 @@ if available systemctl; then
     configure_systemd
 fi
 
-if available llama-swap; then
+if bin=$(command -v llama-swap); then
     status "Removing llama-swap binary..."
-    $SUDO rm $(which llama-swap)
+    $SUDO rm -- "$bin"
 fi
 
 if [ -f "/usr/share/llama-swap/config.yaml" ]; then
