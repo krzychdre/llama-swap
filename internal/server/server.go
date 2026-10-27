@@ -245,13 +245,18 @@ func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.
 		return nil, fmt.Errorf("store is required")
 	}
 
+	retentionDays := 0
+	if cfg.Store != nil {
+		retentionDays = cfg.Store.RetentionDays
+	}
+
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	s := &Server{
 		cfg:           cfg,
 		logs:          logs,
 		perf:          perfMon,
 		inflight:      newInflightTracker(),
-		metrics:       newMetricsMonitor(logs.ProxyLogs, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, st),
+		metrics:       newMetricsMonitor(logs.ProxyLogs, cfg.MetricsMaxInMemory, retentionDays, cfg.CaptureBuffer, st),
 		store:         st,
 		build:         build,
 		hardware:      hardware,

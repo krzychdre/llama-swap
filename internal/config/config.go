@@ -146,6 +146,8 @@ type HookOnStartup struct {
 
 type Store struct {
 	Path string `yaml:"path"`
+	// RetentionDays deletes activity rows older than this many days; 0 keeps them forever.
+	RetentionDays int `yaml:"retentionDays"`
 }
 
 type UIConfig struct {

@@ -55,8 +55,10 @@ logToStdout: "proxy"
 # - optional, default: in-memory sqlite database capped by metricsMaxInMemory
 # - path is a sqlite database file path
 # - file-backed sqlite keeps activity logs across restarts
+# - retentionDays deletes activity logs older than this many days, default: 0 (keep forever)
 # store:
 #   path: /path/to/file.sqlite
+#   retentionDays: 30
 
 # metricsMaxInMemory: maximum number of metrics to keep in memory
 # - optional, default: 1000

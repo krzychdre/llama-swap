@@ -40,12 +40,13 @@ func (e ActivityLogEvent) Type() uint32 {
 type metricsMonitor struct {
 	store          store.Store
 	maxMetrics     int
+	retentionDays  int
 	logger         *logmon.Monitor
 	enableCaptures bool
 	captureCache   *cache.Cache // zstd-compressed CBOR of ReqRespCapture
 }
 
-func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int, st store.Store) *metricsMonitor {
+func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, retentionDays int, captureBufferMB int, st store.Store) *metricsMonitor {
 	if maxMetrics <= 0 {
 		maxMetrics = 1000
 	}
@@ -53,6 +54,7 @@ func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB i
 		logger:         logger,
 		store:          st,
 		maxMetrics:     maxMetrics,
+		retentionDays:  retentionDays,
 		enableCaptures: captureBufferMB > 0,
 	}
 	if captureBufferMB > 0 {
@@ -77,6 +79,12 @@ func (mp *metricsMonitor) queueMetrics(metric ActivityLogEntry) (ActivityLogEntr
 	if mp.store.IsInMemory() {
 		if err := mp.store.Activity().Prune(ctx, mp.maxMetrics); err != nil {
 			mp.warnf("failed to prune activity metrics: %v", err)
+		}
+	}
+	if mp.retentionDays > 0 {
+		cutoff := time.Now().AddDate(0, 0, -mp.retentionDays)
+		if err := mp.store.Activity().PruneBefore(ctx, cutoff); err != nil {
+			mp.warnf("failed to prune activity metrics past retention: %v", err)
 		}
 	}
 	return stored, true

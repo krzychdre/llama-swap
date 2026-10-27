@@ -3,8 +3,8 @@ title: Observability, storage and Activity
 summary: Use logs, metrics, captures and the Activity view to diagnose requests and retain useful history.
 category: guides
 tags: [operations, logs, metrics, activity, captures, stdout, http]
-config_keys: [logLevel, logToStdout, metricsMaxInMemory, captureBuffer]
-updated: 2026-09-25
+config_keys: [logLevel, logToStdout, metricsMaxInMemory, captureBuffer, store.path, store.retentionDays]
+updated: 2026-10-27
 ---
 
 # Observability, storage and Activity
@@ -19,6 +19,19 @@ logLevel: debug
 logToStdout: "proxy,http"
 metricsMaxInMemory: 1000
 captureBuffer: 100
+```
+
+## Persistent activity
+
+Set `store.path` to keep Activity rows in a SQLite file across restarts.
+`metricsMaxInMemory` then has no effect, so set `store.retentionDays` to delete
+rows older than that many days. Rows are pruned as new requests are recorded;
+the default `0` keeps them forever.
+
+```yaml
+store:
+  path: /var/lib/llama-swap/llama-swap.db
+  retentionDays: 30
 ```
 
 ## Log streams

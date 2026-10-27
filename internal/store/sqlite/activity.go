@@ -210,6 +210,15 @@ func (r *activityRepository) Prune(ctx context.Context, maxRows int) error {
 	return nil
 }
 
+func (r *activityRepository) PruneBefore(ctx context.Context, cutoff time.Time) error {
+	if _, err := r.db.ExecContext(ctx,
+		`DELETE FROM activity WHERE ts_created < ?`, cutoff.Unix(),
+	); err != nil {
+		return fmt.Errorf("prune activity before %s: %w", cutoff.Format(time.RFC3339), err)
+	}
+	return nil
+}
+
 // activityOrderBy builds a safe ORDER BY clause from the query's sort key and
 // direction. Unknown sort keys fall back to "id". A secondary "id" sort keeps
 // pagination stable when the primary column has duplicate values.

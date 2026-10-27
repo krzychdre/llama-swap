@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -900,5 +901,40 @@ func TestServer_MetricsMiddleware_UpstreamAudioCaptureSkipsRespBody(t *testing.T
 	}
 	if len(cap.RespHeaders) == 0 {
 		t.Error("RespHeaders not stored; want captureRespHeaders mask")
+	}
+}
+
+func TestMetricsMonitor_QueueMetricsRetention(t *testing.T) {
+	tests := []struct {
+		name          string
+		retentionDays int
+		wantModels    []string
+	}{
+		{name: "prunes rows past retention", retentionDays: 7, wantModels: []string{"fresh"}},
+		{name: "zero keeps every row", retentionDays: 0, wantModels: []string{"fresh", "old"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mm := newTestMetricsMonitor(t, nil, 10, 0)
+			mm.retentionDays = tt.retentionDays
+
+			now := time.Now()
+			for _, e := range []ActivityLogEntry{
+				{Model: "old", Timestamp: now.AddDate(0, 0, -8)},
+				{Model: "fresh", Timestamp: now},
+			} {
+				if _, ok := mm.queueMetrics(e); !ok {
+					t.Fatalf("queueMetrics(%s) failed", e.Model)
+				}
+			}
+
+			var got []string
+			for _, e := range metricsEntries(t, mm) {
+				got = append(got, e.Model)
+			}
+			if !slices.Equal(got, tt.wantModels) {
+				t.Errorf("models = %v, want %v", got, tt.wantModels)
+			}
+		})
 	}
 }

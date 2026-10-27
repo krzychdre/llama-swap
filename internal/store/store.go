@@ -4,7 +4,10 @@
 // interfaces here so a backend can be swapped or faked without touching them.
 package store
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Store is the root of data access. It groups one repository per kind of
 // persisted data, all backed by the same underlying database, and owns that
@@ -41,4 +44,7 @@ type ActivityRepository interface {
 	// Prune deletes all but the newest maxRows entries. A maxRows of zero or
 	// less is a no-op.
 	Prune(ctx context.Context, maxRows int) error
+
+	// PruneBefore deletes entries whose Timestamp is before cutoff.
+	PruneBefore(ctx context.Context, cutoff time.Time) error
 }

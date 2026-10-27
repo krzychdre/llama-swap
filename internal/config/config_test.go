@@ -75,10 +75,12 @@ func TestConfig_StorePath(t *testing.T) {
 		cfg, err := LoadConfigFromReader(strings.NewReader(`
 store:
   path: ` + storePath + `
+  retentionDays: 30
 `))
 		require.NoError(t, err)
 		require.NotNil(t, cfg.Store)
 		assert.Equal(t, storePath, cfg.Store.Path)
+		assert.Equal(t, 30, cfg.Store.RetentionDays)
 	})
 
 	t.Run("existing writable file accepted", func(t *testing.T) {
