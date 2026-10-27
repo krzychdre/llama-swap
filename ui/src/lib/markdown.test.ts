@@ -57,6 +57,23 @@ describe("renderMarkdown", () => {
       expect(result).toContain("katex");
       expect(result).toContain("<math");
     });
+
+    it("keeps katex inline styles a fraction needs", () => {
+      const result = renderMarkdown("$\\frac{a}{b}$");
+      // The fraction rule is drawn with borders, so those declarations survive.
+      expect(result).toMatch(/<span[^>]*style="[^"]*border-bottom-width:0\.04em/);
+      // Height and vertical-align position the numerator and denominator.
+      expect(result).toMatch(/<span[^>]*style="[^"]*(height|vertical-align):-?[0-9.]+em/);
+    });
+
+    it("drops positioning styles from model-authored spans", () => {
+      const result = renderMarkdown(
+        '<span style="position:fixed;top:0;left:0;width:100%;height:100%;background-color:#000">Sign in to continue</span>',
+      );
+      expect(result).not.toContain("position");
+      expect(result).not.toContain("width:100%");
+      expect(result).toContain("Sign in to continue");
+    });
   });
 
   describe("KaTeX math rendering", () => {
