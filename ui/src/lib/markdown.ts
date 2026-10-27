@@ -203,34 +203,41 @@ const katexMathmlAttributes = [
   "mathbackground",
 ];
 
-// The only CSS properties katex writes inline, with values such as
-// "0.8141em", "-3.063em", "#cc0000", "relative" and
-// "calc(100% - 0.1111em)".
-const katexStyleProperties = [
-  "background-color",
-  "border-bottom-width",
-  "border-right-style",
-  "border-right-width",
-  "border-style",
-  "border-top-width",
-  "border-width",
-  "bottom",
-  "color",
-  "height",
-  "left",
-  "margin",
-  "margin-left",
-  "margin-right",
-  "min-width",
-  "padding-left",
-  "position",
-  "text-shadow",
-  "top",
-  "vertical-align",
-  "width",
-];
+const emLength = `-?[0-9.]+em`;
+const katexColor = `#[0-9a-fA-F]{3,8}|[a-zA-Z]+`;
 
-const katexStyleDeclaration = `(?:${katexStyleProperties.join("|")}):(?:[-0-9.a-z%# ]+|calc\\([-0-9.a-z% ]+\\));?`;
+// The only CSS properties katex writes inline, each with the value shapes it
+// actually produces. `position` stays `relative` and the lengths stay in em, so
+// a model-authored span cannot pin itself over the page with
+// "position:fixed;top:0;width:100%;height:100%".
+const katexStyleProperties: Record<string, string> = {
+  "background-color": katexColor,
+  "border-bottom-width": emLength,
+  "border-right-style": "solid",
+  "border-right-width": emLength,
+  "border-style": "solid",
+  "border-top-width": emLength,
+  "border-width": emLength,
+  border: `${emLength} solid (?:${katexColor})`,
+  bottom: emLength,
+  color: katexColor,
+  height: emLength,
+  left: emLength,
+  margin: `0 ${emLength}`,
+  "margin-left": emLength,
+  "margin-right": emLength,
+  "min-width": emLength,
+  "padding-left": emLength,
+  position: "relative",
+  "text-shadow": `${emLength} ${emLength} -?[0-9.]+px`,
+  top: emLength,
+  "vertical-align": emLength,
+  width: `${emLength}|calc\\(100% - ${emLength}\\)`,
+};
+
+const katexStyleDeclaration = `(?:${Object.entries(katexStyleProperties)
+  .map(([property, value]) => `${property}:(?:${value})`)
+  .join("|")});?`;
 
 const katexStyle = new RegExp(`^(?:${katexStyleDeclaration})+$`);
 

@@ -128,6 +128,60 @@ func TestConfig_MacroChainSizeLimit(t *testing.T) {
 	assert.Contains(t, err.Error(), "macro expansion exceeded")
 }
 
+// A macro whose whole value is one placeholder into another macro takes that
+// macro's value with its type, so a chain keeps the scalar type of the macro it
+// ends at instead of stringifying it.
+func TestConfig_MacroChainKeepsScalarType(t *testing.T) {
+	t.Run("int through one hop", func(t *testing.T) {
+		content := `
+macros:
+  CTX: 4096
+  DEFAULT_CTX: "${CTX}"
+models:
+  m1:
+    cmd: server
+    proxy: http://localhost:8080
+    ttl: "${DEFAULT_CTX}"
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		require.NoError(t, err)
+		assert.Equal(t, 4096, config.Models["m1"].UnloadAfter)
+	})
+
+	t.Run("bool through one hop", func(t *testing.T) {
+		content := `
+macros:
+  FEATURE: true
+  LOADING: "${FEATURE}"
+sendLoadingState: "${LOADING}"
+models:
+  m1:
+    cmd: server
+    proxy: http://localhost:8080
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		require.NoError(t, err)
+		assert.Equal(t, true, config.SendLoadingState)
+	})
+
+	t.Run("int through two hops", func(t *testing.T) {
+		content := `
+macros:
+  CTX: 4096
+  MID: "${CTX}"
+  TOP: "${MID}"
+models:
+  m1:
+    cmd: server
+    proxy: http://localhost:8080
+    ttl: "${TOP}"
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		require.NoError(t, err)
+		assert.Equal(t, 4096, config.Models["m1"].UnloadAfter)
+	})
+}
+
 func TestConfig_MacroForwardReferenceRejected(t *testing.T) {
 	content := `
 macros:

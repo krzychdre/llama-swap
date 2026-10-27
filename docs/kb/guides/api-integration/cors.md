@@ -71,6 +71,11 @@ who may read responses; it does not let another site unload models or switch
 profiles. Requests without an `Origin` header are unaffected, so curl, SDKs and
 MCP clients keep working.
 
+Behind a reverse proxy, add `proxy_set_header Host $host;` to the proxy block.
+A proxy that leaves `Host` pointing at its own address makes every one of those
+browser calls fail this check. A loopback proxy may report the public host in
+`X-Forwarded-Host` instead, but the header is only read from a loopback peer.
+
 ## Restricting to one origin
 
 ```yaml

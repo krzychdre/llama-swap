@@ -66,7 +66,20 @@ func isCrossOrigin(r *http.Request) bool {
 		return false
 	}
 	parsed, err := url.Parse(origin)
-	return err != nil || parsed.Host != r.Host
+	if err != nil {
+		return true
+	}
+	if parsed.Host == r.Host {
+		return false
+	}
+	// A reverse proxy that does not set Host forwards its own address in r.Host
+	// while the browser's Origin names the public host. Only a local proxy is
+	// trusted to report that public host.
+	if !isLoopbackPeer(r.RemoteAddr) {
+		return true
+	}
+	forwarded := r.Header.Get("X-Forwarded-Host")
+	return forwarded == "" || parsed.Host != forwarded
 }
 
 // CreateRequestContextMiddleware returns middleware that extracts model and
