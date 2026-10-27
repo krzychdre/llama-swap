@@ -9,7 +9,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -54,7 +54,7 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 			checkPath := r.URL.Path
 			if strings.HasPrefix(r.URL.Path, "/upstream/") {
 				var found bool
-				_, _, checkPath, found = shared.FindModelInPath(cfg, strings.TrimPrefix(r.URL.Path, "/upstream"))
+				_, _, checkPath, found = swaputil.FindModelInPath(cfg, strings.TrimPrefix(r.URL.Path, "/upstream"))
 				if !found {
 					next.ServeHTTP(w, r)
 					return
@@ -69,12 +69,13 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 			// Resolve the model now so downstream dispatch hits the context
 			// fast path; FetchContext restores the request body for regular
 			// routes and extracts the model from the URL for /upstream routes.
-			data, err := shared.FetchContext(r, cfg)
+			data, err := swaputil.FetchContext(r, cfg)
 			if err != nil {
-				shared.SendError(w, r, shared.ErrNoModelInContext)
+				swaputil.SendError(w, r, swaputil.ErrNoModelInContext)
 				return
 			}
 
+			// Buffer the request body/headers for capture before dispatch
 			// consumes them. The body is also read when it is a JSON request so
 			// stream_options can be injected for streaming backends like vllm.
 			cf := captureFieldsFor(checkPath)
@@ -111,6 +112,9 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 
 			recorder := newBodyCopier(w)
 			next.ServeHTTP(recorder, r)
+			// A request abandoned before any response was written must not be
+			// filed as a successful (empty-body) metric. See #1029.
+			swaputil.MarkClientClosed(recorder, r)
 			mm.record(data.ModelID, r, recorder, cf, reqBody, reqHeaders)
 		})
 	}

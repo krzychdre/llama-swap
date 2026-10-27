@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -64,6 +66,52 @@ models:
 	// this is a contains because it could be `model1` or `model2` depending on the order
 	// go decided on the order of the map
 	assert.Contains(t, err.Error(), "duplicate alias m1 found in model: model")
+}
+
+func TestConfig_StorePath(t *testing.T) {
+	t.Run("path accepted in writable directory", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "llama-swap.db")
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+store:
+  path: ` + storePath + `
+`))
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Store)
+		assert.Equal(t, storePath, cfg.Store.Path)
+	})
+
+	t.Run("existing writable file accepted", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "llama-swap.db")
+		require.NoError(t, os.WriteFile(storePath, []byte("{}"), 0644))
+
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+store:
+  path: ` + storePath + `
+`))
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Store)
+		assert.Equal(t, storePath, cfg.Store.Path)
+	})
+
+	t.Run("non-existent directory rejected", func(t *testing.T) {
+		_, err := LoadConfigFromReader(strings.NewReader(`
+store:
+  path: /no/such/dir/llama-swap.db
+`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not writable")
+	})
+
+	t.Run("empty path rejected", func(t *testing.T) {
+		_, err := LoadConfigFromReader(strings.NewReader(`
+store:
+  path: ""
+`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "store.path must not be empty")
+	})
 }
 
 func TestConfig_FindConfig(t *testing.T) {
@@ -248,6 +296,14 @@ macros:
   MODEL_ID: model1
 `,
 			expectedError: "macro name 'MODEL_ID' is reserved",
+		},
+		{
+			name: "global macro named PID",
+			config: `
+macros:
+  PID: 1234
+`,
+			expectedError: "macro name 'PID' is reserved",
 		},
 		{
 			name: "model macro named PORT",
@@ -919,6 +975,169 @@ models:
 	})
 }
 
+func TestConfig_GlobalConcurrencyLimit(t *testing.T) {
+	t.Run("defaults to 0 (no limit)", func(t *testing.T) {
+		content := `
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, 0, config.GlobalConcurrencyLimit)
+	})
+
+	t.Run("sets the configured value", func(t *testing.T) {
+		content := `
+globalConcurrencyLimit: 4
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, 4, config.GlobalConcurrencyLimit)
+	})
+
+	t.Run("negative value rejected", func(t *testing.T) {
+		content := `
+globalConcurrencyLimit: -1
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		_, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "globalConcurrencyLimit must be >= 0")
+	})
+}
+
+func TestConfig_MaxRequestBodyMB(t *testing.T) {
+	t.Run("defaults to 250", func(t *testing.T) {
+		content := `
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, 250, config.MaxRequestBodyMB)
+		assert.Equal(t, int64(250<<20), config.MaxRequestBodyBytes())
+	})
+
+	t.Run("sets the configured value", func(t *testing.T) {
+		content := `
+maxRequestBodyMB: 1024
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, 1024, config.MaxRequestBodyMB)
+		assert.Equal(t, int64(1024<<20), config.MaxRequestBodyBytes())
+	})
+
+	for _, value := range []string{"0", "-1"} {
+		t.Run("rejects "+value, func(t *testing.T) {
+			content := `
+maxRequestBodyMB: ` + value + `
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+			_, err := LoadConfigFromReader(strings.NewReader(content))
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "maxRequestBodyMB must be >= 1")
+		})
+	}
+
+	t.Run("zero-value Config uses the default", func(t *testing.T) {
+		assert.Equal(t, int64(250<<20), Config{}.MaxRequestBodyBytes())
+	})
+}
+
+func TestConfig_UnloadTimeout(t *testing.T) {
+	t.Run("defaults to 10 seconds", func(t *testing.T) {
+		content := `
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, DEFAULT_UNLOAD_TIMEOUT, config.UnloadTimeout)
+		assert.Equal(t, DEFAULT_UNLOAD_TIMEOUT, config.Models["model1"].UnloadTimeout)
+	})
+
+	t.Run("global unloadTimeout sets model default", func(t *testing.T) {
+		content := `
+unloadTimeout: 25
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, 25, config.UnloadTimeout)
+		assert.Equal(t, 25, config.Models["model1"].UnloadTimeout)
+	})
+
+	t.Run("model unloadTimeout overrides global", func(t *testing.T) {
+		content := `
+unloadTimeout: 25
+models:
+  model1:
+    cmd: server --port ${PORT}
+    unloadTimeout: 45
+  model2:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, 25, config.UnloadTimeout)
+		assert.Equal(t, 45, config.Models["model1"].UnloadTimeout)
+		assert.Equal(t, 25, config.Models["model2"].UnloadTimeout)
+	})
+
+	t.Run("model unloadTimeout=0 uses global", func(t *testing.T) {
+		content := `
+unloadTimeout: 25
+models:
+  model1:
+    cmd: server --port ${PORT}
+    unloadTimeout: 0
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, 25, config.Models["model1"].UnloadTimeout)
+	})
+
+	t.Run("negative global unloadTimeout rejected", func(t *testing.T) {
+		content := `
+unloadTimeout: -1
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		_, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "unloadTimeout must be >= 0")
+	})
+
+	t.Run("negative model unloadTimeout rejected", func(t *testing.T) {
+		content := `
+models:
+  model1:
+    cmd: server --port ${PORT}
+    unloadTimeout: -1
+`
+		_, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "model model1: invalid unloadTimeout value -1")
+	})
+}
+
 func TestConfig_EnvMacros(t *testing.T) {
 	t.Run("basic env substitution in cmd", func(t *testing.T) {
 		t.Setenv("TEST_MODEL_PATH", "/opt/models")
@@ -1486,6 +1705,23 @@ models:
 	assert.Equal(t, 90, modelConfig.Timeouts.IdleConn)
 }
 
+func TestConfig_DisableKeepAlives(t *testing.T) {
+	configYaml := `
+models:
+  model1:
+    cmd: test-server --port ${PORT}
+  model2:
+    cmd: test-server --port ${PORT}
+    disableKeepAlives: true
+`
+
+	config, err := LoadConfigFromReader(strings.NewReader(configYaml))
+	require.NoError(t, err)
+
+	assert.False(t, config.Models["model1"].DisableKeepAlives, "keep-alives stay on by default")
+	assert.True(t, config.Models["model2"].DisableKeepAlives)
+}
+
 func TestConfig_TimeoutsZeroAllowed(t *testing.T) {
 	configYaml := `
 models:
@@ -1588,7 +1824,7 @@ matrix:
 	require.NoError(t, err)
 	assert.Equal(t, "matrix", cfg.Routing.Router.Use)
 	require.NotNil(t, cfg.Routing.Router.Settings.Matrix)
-	assert.Len(t, cfg.Routing.Router.Settings.Matrix.ExpandedSets, 2)
+	assert.NotNil(t, cfg.Routing.Router.Settings.Matrix.Program())
 }
 
 func TestConfig_Routing_RouterUseMatrix(t *testing.T) {
@@ -1608,7 +1844,7 @@ routing:
 	require.NoError(t, err)
 	assert.Equal(t, "matrix", cfg.Routing.Router.Use)
 	require.NotNil(t, cfg.Routing.Router.Settings.Matrix)
-	assert.Len(t, cfg.Routing.Router.Settings.Matrix.ExpandedSets, 2)
+	assert.NotNil(t, cfg.Routing.Router.Settings.Matrix.Program())
 }
 
 func TestConfig_Routing_RouterUseGroup(t *testing.T) {

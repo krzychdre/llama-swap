@@ -33,34 +33,73 @@ test:
 test-all:
 	go test -race -count=1 ./internal/...
 
-ui/node_modules:
-	cd ui-svelte && npm install
+# Test suites for the cmd utilities (kubeswap, vllm-wrapper). Kept
+# separate from test-all: those packages are unix-only (vllm-wrapper
+# signals the serve proxy with syscall.Kill), so they must not be part
+# of the target the Windows CI runs.
+test-cmd:
+	go test -race -count=1 ./cmd/kubeswap ./cmd/vllm-wrapper
 
-# build react UI into internal/server/ui_dist; the `embed_ui` build tag embeds
+# Lint and render the kubeswap Helm chart (requires helm on PATH).
+# Renders every supported config shape (stock defaults, structured with
+# each matrix builder, an existing ConfigMap) and asserts that the
+# chart's own contradictory-input guards still fail rendering.
+test-chart:
+	helm lint cmd/kubeswap/chart
+	@helm template llama-swap cmd/kubeswap/chart -n llama-swap > /dev/null \
+		&& echo "chart: default (inline demo) render OK"
+	@for f in cmd/kubeswap/chart/test-values/*.yaml; do \
+		if ! helm template llama-swap cmd/kubeswap/chart -n llama-swap -f $$f > /dev/null; then \
+			echo "chart: render FAILED: $$f"; exit 1; \
+		fi; \
+		echo "chart: render OK: $$f"; \
+	done
+	@for f in cmd/kubeswap/chart/test-values-invalid/*.yaml; do \
+		if helm template llama-swap cmd/kubeswap/chart -n llama-swap -f $$f > /dev/null 2>&1; then \
+			echo "chart: $$f was expected to fail rendering"; exit 1; \
+		else \
+			echo "chart: correctly rejected: $$f"; \
+		fi; \
+	done
+
+ui/node_modules:
+	cd ui && npm install
+
+# build the UI into internal/server/ui_dist; the `embed_ui` build tag embeds
 # this output into the binary (see internal/server/embed.go)
 ui: ui/node_modules
-	cd ui-svelte && npm run build
+	cd ui && npm run build
+
+# copy the Go and TypeScript source, without tests, into
+# internal/mcptools/sourcecode/_src; the `embed_src` build tag embeds it for
+# the Help agent's code__* tools (see internal/mcptools/sourcecode/embed.go)
+SRC_DIR = internal/mcptools/sourcecode/_src
+src:
+	rm -rf $(SRC_DIR)
+	mkdir -p $(SRC_DIR)
+	git ls-files -z --cached --others --exclude-standard -- '*.go' 'ui/*.ts' 'ui/*.svelte' \
+		':(exclude)*_test.go' ':(exclude)*.test.ts' | tar -cf - --null -T - | tar -xf - -C $(SRC_DIR)
 
 # Build OSX binary
-mac: ui
+mac: ui src
 	@echo "Building Mac binary..."
-	GOOS=darwin GOARCH=arm64 go build -tags embed_ui -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-darwin-arm64
+	GOOS=darwin GOARCH=arm64 go build -tags embed_ui,embed_src -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-darwin-arm64
 
 # Build Linux binary
 linux: linux-arm64 linux-amd64
 
-linux-amd64: ui
+linux-amd64: ui src
 	@echo "Building Linux AMD64 binary..."
-	GOOS=linux GOARCH=amd64 go build -tags embed_ui -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-linux-amd64
+	GOOS=linux GOARCH=amd64 go build -tags embed_ui,embed_src -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-linux-amd64
 
-linux-arm64: ui
+linux-arm64: ui src
 	@echo "Building Linux ARM64 binary..."
-	GOOS=linux GOARCH=arm64 go build -tags embed_ui -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-linux-arm64
+	GOOS=linux GOARCH=arm64 go build -tags embed_ui,embed_src -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-linux-arm64
 
 # Build Windows binary
-windows: ui
+windows: ui src
 	@echo "Building Windows binary..."
-	GOOS=windows GOARCH=amd64 go build -tags embed_ui -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-windows-amd64.exe
+	GOOS=windows GOARCH=amd64 go build -tags embed_ui,embed_src -ldflags="-X main.commit=${GIT_HASH} -X main.version=${GIT_VERSION} -X main.date=${BUILD_DATE}" -o $(BUILD_DIR)/$(APP_NAME)-windows-amd64.exe
 
 # for testing with real external processes
 simple-responder:
@@ -87,8 +126,13 @@ release:
 # Get the highest tag in v{number} format, increment it, and create a new tag
 	@highest_tag=$$(git tag --sort=-v:refname | grep -E '^v[0-9]+$$' | head -n 1 || echo "v0"); \
 	new_tag="v$$(( $${highest_tag#v} + 1 ))"; \
+	echo "Checking for a changelog entry for: $$new_tag"; \
+	if ! grep -qE "^## $$new_tag( |$$)" CHANGELOG.md; then \
+		echo "Error: CHANGELOG.md has no entry for $$new_tag. Add a '## $$new_tag' section and commit it." >&2; \
+		exit 1; \
+	fi; \
 	echo "tagging new version: $$new_tag"; \
-	git tag "$$new_tag";
+	git tag "$$new_tag"
 
 GOOS ?= $(shell go env GOOS 2>/dev/null || echo linux)
 GOARCH ?= $(shell go env GOARCH 2>/dev/null || echo amd64)
@@ -96,9 +140,22 @@ wol-proxy: $(BUILD_DIR)
 	@echo "Building wol-proxy"
 	go build -o $(BUILD_DIR)/wol-proxy-$(GOOS)-$(GOARCH)-$(shell date +%Y-%m-%d) cmd/wol-proxy/wol-proxy.go
 
+# Build the kubeswap Kubernetes backend wrapper (host-side binary; also
+# built into the unified image, see docker/unified/install-kubeswap.sh)
+KUBESWAP_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
+kubeswap: $(BUILD_DIR)
+	@echo "Building kubeswap"
+	go build -trimpath -ldflags "-X main.version=$(KUBESWAP_VERSION) -X main.buildTime=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)" -o $(BUILD_DIR)/kubeswap-$(GOOS)-$(GOARCH) ./cmd/kubeswap
+
 test-ui:
-	cd ui-svelte && npm ci && npm run check && npm test
+	cd ui && npm ci && npm run check && npm test
+
+# Score the Playground's Docs Agent against a local model. Builds and starts
+# llama-swap itself; see evals/docs-agent/README.md for the tuning loop.
+eval-docs-agent:
+	./evals/docs-agent/run.sh $(EVAL_ARGS)
 
 # Phony targets
-.PHONY: all clean ui mac windows simple-responder simple-responder-windows test test-all test-dev test-ui wol-proxy
-.PHONE: linux linux-arm64 linux-amd64
+.PHONY: all clean ui src mac windows simple-responder simple-responder-windows test test-all test-chart test-dev test-ui wol-proxy kubeswap eval-docs-agent release
+.PHONY: linux linux-arm64 linux-amd64

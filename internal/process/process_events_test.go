@@ -8,15 +8,15 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 func TestProcessCommand_EmitsStateChangeEvents(t *testing.T) {
 	skipIfNoSimpleResponder(t)
 
 	var mu sync.Mutex
-	var transitions []shared.ProcessStateChangeEvent
-	cancel := event.On(func(e shared.ProcessStateChangeEvent) {
+	var transitions []swaputil.ProcessStateChangeEvent
+	cancel := event.On(func(e swaputil.ProcessStateChangeEvent) {
 		if e.ProcessName != t.Name() {
 			return
 		}
@@ -78,5 +78,36 @@ func TestProcessCommand_EmitsStateChangeEvents(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("transitions = %v, want %v", got, want)
 		}
+	}
+}
+
+func TestProcessCommand_ReadySince(t *testing.T) {
+	skipIfNoSimpleResponder(t)
+
+	cmd, port := simpleResponderCmd(t, "-silent", "-respond hello")
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:                cmd,
+		Proxy:              fmt.Sprintf("http://127.0.0.1:%d", port),
+		CheckEndpoint:      "/health",
+		HealthCheckTimeout: 10,
+	})
+
+	if got := p.Status(); got.State != StateStopped || !got.ReadySince.IsZero() {
+		t.Fatalf("Status before start = %+v, want stopped with zero ReadySince", got)
+	}
+
+	before := time.Now()
+	runErr := runAsync(t, p)
+	got := p.Status()
+	if got.State != StateReady || got.ReadySince.Before(before) || got.ReadySince.After(time.Now()) {
+		t.Errorf("Status = %+v, want ready with ReadySince between %v and now", got, before)
+	}
+
+	if err := p.Stop(testStopTimeout); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	<-runErr
+	if got := p.Status(); got.State != StateStopped || !got.ReadySince.IsZero() {
+		t.Errorf("Status after stop = %+v, want stopped with zero ReadySince", got)
 	}
 }

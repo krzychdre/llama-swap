@@ -3,6 +3,7 @@ package process
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,10 +18,49 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 var ErrStartAborted = fmt.Errorf("aborted")
+
+// healthCheckKey marks requests issued by the health check loop, which polls
+// the upstream through the same reverse proxy. Their failures are the expected
+// shape of a model still booting, so they must not be logged as proxy errors.
+type healthCheckKey struct{}
+
+// newProxyErrorHandler builds the ErrorHandler for a model's reverse proxy.
+//
+// httputil.ReverseProxy's default handler answers every failure with 502, so a
+// client hanging up mid-generation is logged as a Bad Gateway and sends
+// operators looking at an inference server that was healthy the whole time.
+// Cancellation is classified here, where the error is actually known: the
+// request is recorded with the client-closed sentinel rather than blamed on the
+// upstream, and at debug level because an impatient caller is normal traffic.
+// Real upstream failures keep the 502. See #1029.
+func newProxyErrorHandler(id string, proxyLogger *logmon.Monitor) func(http.ResponseWriter, *http.Request, error) {
+	return func(w http.ResponseWriter, r *http.Request, err error) {
+		// Pick the log level first: a cancelled request is never an upstream
+		// fault, whether or not the sentinel ends up applying below.
+		switch {
+		case errors.Is(err, context.Canceled) || r.Context().Err() != nil:
+			proxyLogger.Debugf("<%s> request cancelled: %v", id, err)
+		case r.Context().Value(healthCheckKey{}) != nil:
+			proxyLogger.Debugf("<%s> health check not ready: %v", id, err)
+		default:
+			proxyLogger.Warnf("<%s> proxy error: %v", id, err)
+		}
+
+		// Only a client that actually hung up gets the recorded-only sentinel.
+		// A request cancelled server-side (an operator cancelling it from the
+		// UI, or shutdown) still has a client waiting, and must be answered —
+		// otherwise net/http finalizes it as an empty 200, telling the caller
+		// the request succeeded.
+		if swaputil.MarkClientClosed(w, r) || swaputil.ResponseStarted(w) {
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}
+}
 
 // cmdWaitDelay is the upper bound the runtime will wait for child I/O to
 // drain after the process exits before force-closing the stdout/stderr
@@ -38,9 +78,15 @@ const cmdWaitDelay = 10 * time.Second
 // bounds the rare case where a process is still alive when its context is cut.
 const parentCancelGraceTimeout = time.Second
 
-type runReq struct {
+// startReq asks the run loop to bring the process up. Run and EnsureReady share
+// this one request type — and therefore one code path — so there is only ever a
+// single way to start a process. block selects the caller's semantics: Run parks
+// its response until the process terminates, EnsureReady is answered as soon as
+// the process is ready or the start fails.
+type startReq struct {
 	timeout time.Duration
 	respond chan error
+	block   bool
 }
 
 type stopReq struct {
@@ -83,20 +129,23 @@ type ProcessCommand struct {
 	// pipe-close backstop from dominating their runtime.
 	waitDelay time.Duration
 
-	runCh       chan runReq
+	startCh     chan startReq
 	stopCh      chan stopReq
 	waitReadyCh chan waitReadyReq
 	sleepCh     chan sleepReq
 	wakeCh      chan wakeReq
 
-	// current ProcessState. Written only by run(); read by State() via atomic load.
-	state atomic.Value
+	// current Status. Written only by run(); read by State() and Status()
+	// via atomic load.
+	status atomic.Pointer[Status]
 
 	// stores the active reverse-proxy handler when the process is running.
 	// Written only by run(); read by ServeHTTP via atomic load.
 	handler atomic.Pointer[http.HandlerFunc]
 
-	lastUse  atomic.Int64 // unix nano timestamp of last ServeHTTP completion
+	// lastUse is the unix-nano timestamp of the most recent activity baseline.
+	// It is initialized when the process becomes Ready and updated after ServeHTTP completes.
+	lastUse  atomic.Int64
 	inflight atomic.Int64 // current in-flight ServeHTTP calls
 }
 
@@ -116,14 +165,14 @@ func New(
 		processLogger: processLogger,
 		proxyLogger:   proxyLogger,
 
-		runCh:       make(chan runReq),
+		startCh:     make(chan startReq),
 		stopCh:      make(chan stopReq),
 		waitReadyCh: make(chan waitReadyReq),
 		sleepCh:     make(chan sleepReq),
 		wakeCh:      make(chan wakeReq),
 		waitDelay:   cmdWaitDelay,
 	}
-	p.state.Store(StateStopped)
+	p.status.Store(&Status{State: StateStopped})
 
 	go p.run()
 	return p, nil
@@ -141,15 +190,23 @@ func (p *ProcessCommand) Logger() *logmon.Monitor { return p.processLogger }
 func (p *ProcessCommand) run() {
 	// Mutable state — only read/written from this goroutine. ServeHTTP reads
 	// p.handler concurrently, which is why handler is an atomic.Pointer.
-	// p.state mirrors `state` so State() can observe transitions; setState
+	// p.status mirrors `state` so State() can observe transitions; setState
 	// writes both.
 	state := StateStopped
 	setState := func(s ProcessState) {
 		old := state
 		state = s
-		p.state.Store(s)
+		next := &Status{State: s}
+		if s == StateReady {
+			if old == StateReady {
+				next.ReadySince = p.status.Load().ReadySince
+			} else {
+				next.ReadySince = time.Now()
+			}
+		}
+		p.status.Store(next)
 		if old != s {
-			event.Emit(shared.ProcessStateChangeEvent{
+			event.Emit(swaputil.ProcessStateChangeEvent{
 				ProcessName: p.id,
 				OldState:    string(old),
 				NewState:    string(s),
@@ -169,8 +226,9 @@ func (p *ProcessCommand) run() {
 	)
 
 	// notifyWaiters wakes every blocked WaitReady caller with the given result.
-	// Used on transitions out of StateStarting (ready, failed, aborted, or
-	// shutdown) — anything that resolves the "is it ready yet?" question.
+	// It must be called on every transition into a state that resolves the
+	// "is it ready yet?" question — ready, failed, aborted, shutdown, stopped,
+	// or exited. Missing one strands the subscriber forever (issue #946).
 	notifyWaiters := func(err error) {
 		for _, w := range readyWaiters {
 			select {
@@ -187,6 +245,66 @@ func (p *ProcessCommand) run() {
 			runResp <- err
 			runResp = nil
 		}
+	}
+
+	// wakeSleeping restores a sleeping model to ready and answers respond with
+	// the result. It reports true when the parent context ended mid-wake and
+	// run() must return.
+	wakeSleeping := func(timeout time.Duration, respond chan<- error) bool {
+		setState(StateWaking)
+		wakeCtx, cancelWake := context.WithCancel(context.Background())
+		defer cancelWake()
+		wakeResultCh := make(chan error, 1)
+		go func() { wakeResultCh <- p.doWake(wakeCtx, timeout) }()
+
+		select {
+		case err := <-wakeResultCh:
+			if err != nil {
+				p.proxyLogger.Errorf("<%s> wake failed, stopping: %v", p.id, err)
+				setState(StateStopping)
+				p.killProcess(cmd, cmdCancel, cmdDone, timeout)
+				cmd, cmdDone, cmdCancel = nil, nil, nil
+				p.handler.Store(nil)
+				setState(StateStopped)
+				respondRun(fmt.Errorf("[%s] wake failed: %w", p.id, err))
+				notifyWaiters(err)
+			} else {
+				p.lastUse.Store(time.Now().UnixNano())
+				setState(StateReady)
+				notifyWaiters(nil)
+				p.startTTLLoop()
+				p.proxyLogger.Infof("<%s> Model is now awake", p.id)
+			}
+			respond <- err
+
+		case stop := <-p.stopCh:
+			cancelWake()
+			<-wakeResultCh
+			setState(StateStopping)
+			p.killProcess(cmd, cmdCancel, cmdDone, stop.timeout)
+			cmd, cmdDone, cmdCancel = nil, nil, nil
+			p.handler.Store(nil)
+			setState(StateStopped)
+			respondRun(nil)
+			notifyWaiters(ErrStartAborted)
+			respond <- ErrStartAborted
+			stop.respond <- nil
+
+		case <-p.parentCtx.Done():
+			cancelWake()
+			setState(StateShutdown)
+			<-wakeResultCh
+			if cmd != nil {
+				p.handler.Store(nil)
+				p.killProcess(cmd, cmdCancel, cmdDone, parentCancelGraceTimeout)
+				cmd, cmdDone, cmdCancel = nil, nil, nil
+			}
+			notifyWaiters(fmt.Errorf("[%s] shutdown", p.id))
+			respondRun(fmt.Errorf("[%s] shutdown", p.id))
+			respond <- fmt.Errorf("[%s] shutdown", p.id)
+			return true
+		}
+		return false
 	}
 
 	for {
@@ -224,6 +342,12 @@ func (p *ProcessCommand) run() {
 			cmdCancel = nil
 			p.handler.Store(nil)
 			setState(StateStopped)
+			p.proxyLogger.Warnf("<%s> upstream process exited unexpectedly", p.id)
+			// Safety net: readyWaiters is normally empty here because
+			// WaitReady is answered immediately while StateReady. Notifying
+			// anyway keeps the invariant that no transition into a settled
+			// state can leave a subscriber parked forever.
+			notifyWaiters(fmt.Errorf("[%s] upstream exited unexpectedly", p.id))
 			respondRun(fmt.Errorf("[%s] upstream exited unexpectedly", p.id))
 
 		// WaitReady: if we're already in a terminal-for-this-question state,
@@ -239,12 +363,36 @@ func (p *ProcessCommand) run() {
 				readyWaiters = append(readyWaiters, req)
 			}
 
-		// Run: start the upstream process. Only valid from StateStopped.
+		// Start the upstream process (Run or EnsureReady — see startReq).
 		// doStart can take a long time (health-check polling), so it runs in
 		// a separate goroutine and we wait on resultCh. While waiting we also
 		// listen for an incoming Stop — that's how callers cancel an in-flight
 		// start.
-		case req := <-p.runCh:
+		case req := <-p.startCh:
+			// EnsureReady answers straight from the current state when the
+			// "is it ready?" question is already settled. There is deliberately
+			// no StateStopping case: a stop keeps this loop parked inside
+			// killProcess and out of the select, so a request can only ever be
+			// received once the stop has finished and state is Stopped again.
+			// Waiting on the channel IS the synchronisation — the caller never
+			// has to guess the state from outside.
+			if !req.block {
+				switch state {
+				case StateReady:
+					req.respond <- nil
+					continue
+				case StateShutdown:
+					req.respond <- fmt.Errorf("[%s] shutdown", p.id)
+					continue
+				case StateSleeping:
+					if shutdown := wakeSleeping(req.timeout, req.respond); shutdown {
+						return
+					}
+					continue
+				}
+			}
+			// Only valid from StateStopped. For Run this is also the "second
+			// Run while already running" rejection.
 			if state != StateStopped {
 				req.respond <- fmt.Errorf("[%s] could not be started in %s state", p.id, state)
 				continue
@@ -272,12 +420,21 @@ func (p *ProcessCommand) run() {
 					cmdCancel = res.cancel
 					fn := res.handlerFn
 					p.handler.Store(&fn)
+					// A newly ready process starts a fresh idle window. Without this,
+					// lastUse is zero on first start or stale after a restart, so TTL
+					// can unload it on the first one-second ticker tick.
+					p.lastUse.Store(time.Now().UnixNano())
 					setState(StateReady)
 					notifyWaiters(nil)
-					// Park the Run response — Run blocks until the process
-					// terminates, so we only fire this when Stop, parentCtx,
-					// or the upstream exit takes the process down.
-					runResp = req.respond
+					if req.block {
+						// Park the Run response — Run blocks until the process
+						// terminates, so we only fire this when Stop, parentCtx,
+						// or the upstream exit takes the process down.
+						runResp = req.respond
+					} else {
+						// EnsureReady's question is answered: it's ready.
+						req.respond <- nil
+					}
 
 					// Start TTL goroutine if configured — self-terminates
 					// when state leaves StateReady.
@@ -333,6 +490,7 @@ func (p *ProcessCommand) run() {
 
 		// Stop: tear down a running process.
 		case stop := <-p.stopCh:
+			toreDown := cmd != nil
 			if cmd != nil {
 				setState(StateStopping)
 				p.killProcess(cmd, cmdCancel, cmdDone, stop.timeout)
@@ -344,6 +502,15 @@ func (p *ProcessCommand) run() {
 			// Stop is a no-op (and not an error) when already Stopped — this
 			// is what makes it idempotent for callers that don't track state.
 			setState(StateStopped)
+			if toreDown {
+				// A process we just killed is not going to become ready, so
+				// release anyone parked on that question rather than leaving
+				// them stranded (issue #946). Guarded on having actually torn
+				// something down: an idempotent no-op Stop must not cancel a
+				// subscriber waiting on a start that hasn't happened yet, which
+				// is the legitimate `go Run(); WaitReady()` ordering.
+				notifyWaiters(fmt.Errorf("[%s] stopped", p.id))
+			}
 			respondRun(nil)
 			stop.respond <- nil
 
@@ -434,57 +601,7 @@ func (p *ProcessCommand) run() {
 				wake.respond <- nil
 				continue
 			}
-
-			setState(StateWaking)
-			wakeCtx, cancelWake := context.WithCancel(context.Background())
-			wakeResultCh := make(chan error, 1)
-			go func() { wakeResultCh <- p.doWake(wakeCtx, wake.timeout) }()
-
-			select {
-			case err := <-wakeResultCh:
-				cancelWake()
-				if err != nil {
-					p.proxyLogger.Errorf("<%s> wake failed, stopping: %v", p.id, err)
-					setState(StateStopping)
-					p.killProcess(cmd, cmdCancel, cmdDone, wake.timeout)
-					cmd, cmdDone, cmdCancel = nil, nil, nil
-					p.handler.Store(nil)
-					setState(StateStopped)
-					respondRun(fmt.Errorf("[%s] wake failed: %w", p.id, err))
-					notifyWaiters(err)
-				} else {
-					setState(StateReady)
-					notifyWaiters(nil)
-					p.startTTLLoop()
-					p.proxyLogger.Infof("<%s> Model is now awake", p.id)
-				}
-				wake.respond <- err
-
-			case stop := <-p.stopCh:
-				cancelWake()
-				<-wakeResultCh
-				setState(StateStopping)
-				p.killProcess(cmd, cmdCancel, cmdDone, stop.timeout)
-				cmd, cmdDone, cmdCancel = nil, nil, nil
-				p.handler.Store(nil)
-				setState(StateStopped)
-				respondRun(nil)
-				notifyWaiters(ErrStartAborted)
-				wake.respond <- ErrStartAborted
-				stop.respond <- nil
-
-			case <-p.parentCtx.Done():
-				cancelWake()
-				setState(StateShutdown)
-				<-wakeResultCh
-				if cmd != nil {
-					p.handler.Store(nil)
-					p.killProcess(cmd, cmdCancel, cmdDone, parentCancelGraceTimeout)
-					cmd, cmdDone, cmdCancel = nil, nil, nil
-				}
-				notifyWaiters(fmt.Errorf("[%s] shutdown", p.id))
-				respondRun(fmt.Errorf("[%s] shutdown", p.id))
-				wake.respond <- fmt.Errorf("[%s] shutdown", p.id)
+			if shutdown := wakeSleeping(wake.timeout, wake.respond); shutdown {
 				return
 			}
 		}
@@ -520,8 +637,15 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       time.Duration(p.config.Timeouts.IdleConn) * time.Second,
+		DisableKeepAlives:     p.config.DisableKeepAlives,
 	}
+	reverseProxy.ErrorHandler = newProxyErrorHandler(p.id, p.proxyLogger)
 	reverseProxy.ModifyResponse = func(resp *http.Response) error {
+		// Upstreams such as llama-server set their own CORS headers, and
+		// ReverseProxy adds rather than replaces them, so both llama-swap's
+		// and the upstream's would be sent. Keep only ours; see issue #85.
+		swaputil.StripUpstreamCORSHeaders(resp.Header)
+
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 			resp.Header.Set("X-Accel-Buffering", "no")
 		}
@@ -612,7 +736,14 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	case <-time.After(250 * time.Millisecond):
 	}
 
+	// The deadline is pushed back each time the reported progress value
+	// changes, so healthCheckTimeout bounds how long a load may go without
+	// progress rather than how long it may take in total. A message alone does
+	// not count: it can change while the load is stuck, e.g. a growing ETA.
+	// Without a progress value, the deadline is fixed as before.
 	deadline := time.Now().Add(healthCheckTimeout)
+	var lastReport *LoadingProgress
+	var lastProgress *float64
 	for {
 		select {
 		case <-startCtx.Done():
@@ -623,10 +754,16 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		}
 
 		if time.Now().After(deadline) {
+			if lastProgress != nil {
+				return abort(fmt.Errorf("health check timed out after %v without loading progress", healthCheckTimeout))
+			}
 			return abort(fmt.Errorf("health check timed out after %v", healthCheckTimeout))
 		}
 
-		req, _ := http.NewRequestWithContext(startCtx, "GET", p.config.CheckEndpoint, nil)
+		// Tagged so the proxy ErrorHandler logs a not-yet-listening upstream
+		// at debug rather than as a proxy error once per poll.
+		checkCtx := context.WithValue(startCtx, healthCheckKey{}, true)
+		req, _ := http.NewRequestWithContext(checkCtx, "GET", p.config.CheckEndpoint, nil)
 		rr := httptest.NewRecorder()
 		reverseProxy.ServeHTTP(rr, req)
 		resp := rr.Result()
@@ -636,6 +773,17 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 			break
 		} else if startCtx.Err() != nil {
 			return abort(ErrStartAborted)
+		}
+
+		if lp, ok := parseLoadingProgress(rr.Body.Bytes()); ok {
+			if lp.Progress != nil && (lastProgress == nil || *lp.Progress != *lastProgress) {
+				lastProgress = lp.Progress
+				deadline = time.Now().Add(healthCheckTimeout)
+			}
+			if !lp.equal(lastReport) {
+				lastReport = &lp
+				p.setLoading(lp)
+			}
 		}
 
 		select {
@@ -667,9 +815,20 @@ func (p *ProcessCommand) sendStopSignal(cmd *exec.Cmd) error {
 		if err == nil {
 			p.processLogger.Debugf("<%s> sendStopSignal() running stop command: %s", p.id, strings.Join(stopArgs, " "))
 			stopCmd := exec.Command(stopArgs[0], stopArgs[1:]...)
+			stopCmd.Stderr = p.processLogger
+			stopCmd.Stdout = p.processLogger
+			// Bound the pipe copy so a CmdStop that backgrounds a child
+			// holding stdout/stderr cannot block Run() indefinitely.
+			stopCmd.WaitDelay = p.waitDelay
 			stopCmd.Env = cmd.Env
 			setProcAttributes(stopCmd)
 			runErr := stopCmd.Run()
+			// ErrWaitDelay is only returned when the stop command itself
+			// succeeded, so it is not a failure to stop the process.
+			if errors.Is(runErr, exec.ErrWaitDelay) {
+				p.processLogger.Warnf("<%s> sendStopSignal() stop command exited but a child held its output open; output may be truncated", p.id)
+				runErr = nil
+			}
 			if runErr != nil {
 				p.processLogger.Errorf("<%s> sendStopSignal() stop command failed: %v", p.id, runErr)
 			} else {
@@ -752,18 +911,49 @@ func (p *ProcessCommand) ID() string {
 }
 
 func (p *ProcessCommand) Run(timeout time.Duration) error {
-	req := runReq{
+	req := startReq{
 		timeout: timeout,
 		respond: make(chan error, 1),
+		block:   true,
 	}
 	select {
-	case p.runCh <- req:
+	case p.startCh <- req:
 	case <-p.parentCtx.Done():
 		return fmt.Errorf("[%s] shutdown", p.id)
 	}
 	select {
 	case err := <-req.respond:
 		return err
+	case <-p.parentCtx.Done():
+		return fmt.Errorf("[%s] shutdown", p.id)
+	}
+}
+
+// EnsureReady brings the process to a ready state and blocks until it is
+// serving. See the Process interface for the full state-by-state contract.
+//
+// The send on startCh is the synchronisation point: it can only be received
+// when the run loop is back at its select, so a stop that is still in progress
+// naturally holds the request until the process is really stopped. Callers must
+// not inspect State() first — that read races the run loop and is what caused
+// issue #946.
+func (p *ProcessCommand) EnsureReady(ctx context.Context, timeout time.Duration) error {
+	req := startReq{
+		timeout: timeout,
+		respond: make(chan error, 1),
+	}
+	select {
+	case p.startCh <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.parentCtx.Done():
+		return fmt.Errorf("[%s] shutdown", p.id)
+	}
+	select {
+	case err := <-req.respond:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-p.parentCtx.Done():
 		return fmt.Errorf("[%s] shutdown", p.id)
 	}
@@ -850,10 +1040,10 @@ func (p *ProcessCommand) startTTLLoop() {
 			if time.Since(time.Unix(0, p.lastUse.Load())) > ttlDuration {
 				if p.config.SleepWake.Enabled {
 					p.proxyLogger.Infof("<%s> Sleeping model, TTL of %ds reached", p.id, p.config.UnloadAfter)
-					p.Sleep(10 * time.Second)
+					p.Sleep(time.Duration(p.config.UnloadTimeout) * time.Second)
 				} else {
 					p.proxyLogger.Infof("<%s> Unloading model, TTL of %ds reached", p.id, p.config.UnloadAfter)
-					p.Stop(10 * time.Second)
+					p.Stop(time.Duration(p.config.UnloadTimeout) * time.Second)
 				}
 				return
 			}
@@ -1018,16 +1208,24 @@ func (p *ProcessCommand) isSleeping(ctx context.Context) (bool, error) {
 }
 
 func (p *ProcessCommand) State() ProcessState {
-	if s, ok := p.state.Load().(ProcessState); ok {
-		return s
+	return p.Status().State
+}
+
+func (p *ProcessCommand) Status() Status {
+	if st := p.status.Load(); st != nil {
+		return *st
 	}
-	return StateStopped
+	return Status{State: StateStopped}
 }
 
 func (p *ProcessCommand) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fn := p.handler.Load()
 	if fn == nil {
-		http.Error(w, fmt.Sprintf("llama-swap-error: [%s] process is not ready", p.id), http.StatusServiceUnavailable)
+		swaputil.SendResponse(w, r, http.StatusServiceUnavailable, fmt.Sprintf("[%s] process is not ready", p.id))
+		return
+	}
+	if p.config.Compat.IgnoreWebsockets && swaputil.IsWebSocketUpgrade(r) {
+		(*fn)(w, r)
 		return
 	}
 	p.inflight.Add(1)

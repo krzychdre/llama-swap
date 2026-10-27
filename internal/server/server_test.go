@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,12 +12,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/capcompat"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/docagent"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/mcptools"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/store/sqlite"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // stubRouter is a minimal router.LocalRouter for Server dispatch tests.
@@ -26,10 +32,14 @@ type stubRouter struct {
 	serveHTTP     func(http.ResponseWriter, *http.Request)
 	shutdownCalls atomic.Int32
 	running       map[string]process.ProcessState
+	readySince    map[string]time.Time
+	loading       map[string]*process.LoadingProgress
 	unloadCalls   atomic.Int32
 	sleepCalls    atomic.Int32
 	sleepModel    string
 	serveCalls    atomic.Int32
+	unloadModels  []string
+	unloadTimeout time.Duration
 	loggers       map[string]*logmon.Monitor
 }
 
@@ -54,8 +64,19 @@ func (s *stubRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *stubRouter) RunningModels() map[string]process.ProcessState { return s.running }
-func (s *stubRouter) Unload(_ time.Duration, _ ...string)            { s.unloadCalls.Add(1) }
-func (s *stubRouter) SleepModel(modelID string)                      { s.sleepCalls.Add(1); s.sleepModel = modelID }
+func (s *stubRouter) RunningStatus() map[string]process.Status {
+	out := make(map[string]process.Status, len(s.running))
+	for id, st := range s.running {
+		out[id] = process.Status{State: st, ReadySince: s.readySince[id], Loading: s.loading[id]}
+	}
+	return out
+}
+func (s *stubRouter) Unload(timeout time.Duration, models ...string) {
+	s.unloadCalls.Add(1)
+	s.unloadTimeout = timeout
+	s.unloadModels = append([]string(nil), models...)
+}
+func (s *stubRouter) SleepModel(modelID string) { s.sleepCalls.Add(1); s.sleepModel = modelID }
 func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 	if s.loggers != nil {
 		if lg, ok := s.loggers[modelID]; ok {
@@ -67,15 +88,26 @@ func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 
 // newTestServer wires a Server with stub routers and a built mux.
 func newTestServer(local router.LocalRouter, peer router.Router) *Server {
+	return newTestServerWithConfig(config.Config{}, local, peer)
+}
+
+// newTestServerWithConfig is newTestServer with a caller-supplied config, for
+// tests that exercise config-driven middleware wiring in routes().
+func newTestServerWithConfig(cfg config.Config, local router.LocalRouter, peer router.Router) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	proxylog := logmon.NewWriter(io.Discard)
+	logs := logmon.NewGroup(io.Discard, true, true, true)
+	proxylog := logs.ProxyLogs
+	st, err := sqlite.New("")
+	if err != nil {
+		panic(err)
+	}
 	s := &Server{
-		cfg:         config.Config{},
-		muxlog:      logmon.NewWriter(io.Discard),
-		proxylog:    proxylog,
-		upstreamlog: logmon.NewWriter(io.Discard),
+		cfg:         cfg,
+		logs:        logs,
 		inflight:    newInflightTracker(),
-		metrics:     newMetricsMonitor(proxylog, nil, 0, 0),
+		metrics:     newMetricsMonitor(proxylog, 0, 0, st),
+		store:       st,
+		capcompat:   capcompat.New(st.Cache(), proxylog),
 		local:       local,
 		peer:        peer,
 		shutdownCtx: ctx,
@@ -85,6 +117,52 @@ func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 	return s
 }
 
+// newTestServerWithReference is newTestServer plus an indexed documentation
+// library, for the /api/mcp tests. Handlers read s.reference at request time,
+// so no re-registration is needed.
+func newTestServerWithReference(local router.LocalRouter, peer router.Router, fsys fs.FS) *Server {
+	s := newTestServer(local, peer)
+	s.reference = docagent.New(fsys)
+
+	registry, err := mcptools.New(
+		docagent.NewDocsProvider(s.reference),
+		mcptools.NewSysProvider(func() time.Time { return testClock }),
+		config.NewConfigProvider(s.cfg),
+	)
+	if err != nil {
+		panic(err)
+	}
+	s.tools = registry
+	return s
+}
+
+// testClock is the fixed instant SysProvider reports in tests.
+var testClock = time.Date(2026, 3, 14, 15, 9, 26, 0, time.UTC)
+
+func newTestMetricsMonitor(t *testing.T, logger *logmon.Monitor, maxMetrics int, captureBufferMB int) *metricsMonitor {
+	t.Helper()
+	st, err := sqlite.New("")
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("store.Close: %v", err)
+		}
+	})
+	return newMetricsMonitor(logger, maxMetrics, captureBufferMB, st)
+}
+
+func metricsEntries(t *testing.T, mm *metricsMonitor) []ActivityLogEntry {
+	t.Helper()
+	page, err := mm.store.Activity().List(context.Background(), store.ActivityQuery{Limit: 1000, Page: 1})
+	if err != nil {
+		t.Fatalf("ListActivity: %v", err)
+	}
+	mm.overlayCaptureState(page.Data)
+	return page.Data
+}
+
 func chatRequest(model string) *http.Request {
 	body := strings.NewReader(`{"model":"` + model + `"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
@@ -92,11 +170,25 @@ func chatRequest(model string) *http.Request {
 	return req
 }
 
+// audioTaskRequest builds a JSON POST to the /audioapi/v1/tasks/run endpoint
+// carrying the given model field.
+func audioTaskRequest(model string) *http.Request {
+	body := strings.NewReader(`{"model":"` + model + `"}`)
+	req := httptest.NewRequest(http.MethodPost, "/audioapi/v1/tasks/run", body)
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
 func TestServer_New_GroupConfig(t *testing.T) {
-	discard := logmon.NewWriter(io.Discard)
+	discard := logmon.NewGroup(io.Discard, true, true, true)
 	cfg := config.Config{HealthCheckTimeout: 15}
 	cfg.Routing.Router.Use = "group"
-	s, err := New(cfg, discard, discard, discard, nil, nil, BuildInfo{})
+	st, err := sqlite.New("")
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	defer st.Close()
+	s, err := New(cfg, discard, nil, st, BuildInfo{}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New (group): %v", err)
 	}
@@ -109,11 +201,24 @@ func TestServer_New_GroupConfig(t *testing.T) {
 }
 
 func TestServer_New_MatrixConfig(t *testing.T) {
-	discard := logmon.NewWriter(io.Discard)
+	discard := logmon.NewGroup(io.Discard, true, true, true)
 	cfg := config.Config{HealthCheckTimeout: 15}
+	cfg.Models = map[string]config.ModelConfig{
+		"model": {
+			Cmd:   "echo ready",
+			Proxy: "http://localhost:8080",
+		},
+	}
 	cfg.Routing.Router.Use = "matrix"
-	cfg.Routing.Router.Settings.Matrix = &config.MatrixConfig{}
-	s, err := New(cfg, discard, discard, discard, nil, nil, BuildInfo{})
+	cfg.Routing.Router.Settings.Matrix = &config.MatrixConfig{
+		Sets: config.OrderedSets{{Name: "single", DSL: "model"}},
+	}
+	st, err := sqlite.New("")
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	defer st.Close()
+	s, err := New(cfg, discard, nil, st, BuildInfo{}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New (matrix): %v", err)
 	}
@@ -159,6 +264,76 @@ func TestServer_RouteToPeerModel(t *testing.T) {
 	}
 }
 
+func TestServer_RouteToLocalModel_PrefersLocalCollision(t *testing.T) {
+	s := newTestServer(
+		newStubRouter([]string{"shared"}, "local response"),
+		newStubRouter([]string{"shared"}, "peer response"),
+	)
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, chatRequest("shared"))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
+	}
+	if w.Body.String() != "local response" {
+		t.Errorf("body=%q want local response", w.Body.String())
+	}
+}
+
+func TestServer_GlobalConcurrencyLimit(t *testing.T) {
+	t.Run("zero disables the limiter, unbounded requests pass", func(t *testing.T) {
+		s := newTestServerWithConfig(
+			config.Config{GlobalConcurrencyLimit: 0},
+			newStubRouter([]string{"local-model"}, "ok"),
+			newStubRouter(nil, ""),
+		)
+
+		for i := 0; i < 5; i++ {
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, chatRequest("local-model"))
+			if w.Code != http.StatusOK {
+				t.Fatalf("request %d: status=%d body=%q", i, w.Code, w.Body.String())
+			}
+		}
+	})
+
+	t.Run("rejects requests beyond the configured limit with 429", func(t *testing.T) {
+		release := make(chan struct{})
+		started := make(chan struct{})
+		blocking := newStubRouter([]string{"local-model"}, "")
+		blocking.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+			close(started)
+			<-release
+			w.WriteHeader(http.StatusOK)
+		}
+
+		s := newTestServerWithConfig(
+			config.Config{GlobalConcurrencyLimit: 1},
+			blocking,
+			newStubRouter(nil, ""),
+		)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, chatRequest("local-model"))
+		}()
+
+		<-started
+
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, chatRequest("local-model"))
+		if w.Code != http.StatusTooManyRequests {
+			t.Fatalf("status=%d body=%q want 429", w.Code, w.Body.String())
+		}
+
+		close(release)
+		<-done
+	})
+}
+
 func TestServer_UnknownModelReturns404(t *testing.T) {
 	s := newTestServer(
 		newStubRouter([]string{"local-model"}, ""),
@@ -170,6 +345,40 @@ func TestServer_UnknownModelReturns404(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status=%d want 404 body=%q", w.Code, w.Body.String())
+	}
+}
+
+func TestServer_AudioAPIRoutesTaskRequest(t *testing.T) {
+	s := newTestServer(
+		newStubRouter([]string{"local-audio"}, "local audio response"),
+		newStubRouter(nil, ""),
+	)
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, audioTaskRequest("local-audio"))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
+	}
+	if w.Body.String() != "local audio response" {
+		t.Errorf("body=%q want %q", w.Body.String(), "local audio response")
+	}
+}
+
+func TestServer_AudioAPIRewritesUpstreamPath(t *testing.T) {
+	var gotPath string
+	local := newStubRouter([]string{"m1"}, "")
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}
+	s := newTestServer(local, newStubRouter(nil, ""))
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, audioTaskRequest("m1"))
+
+	if gotPath != "/v1/tasks/run" {
+		t.Errorf("upstream path = %q, want /v1/tasks/run", gotPath)
 	}
 }
 
@@ -196,21 +405,6 @@ func TestServer_Health(t *testing.T) {
 	}
 }
 
-func TestServer_CORSPreflight(t *testing.T) {
-	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
-
-	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
-	w := httptest.NewRecorder()
-	s.ServeHTTP(w, req)
-
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("status=%d want 204", w.Code)
-	}
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Errorf("Access-Control-Allow-Origin=%q want *", got)
-	}
-}
-
 func TestServer_Unload(t *testing.T) {
 	local := newStubRouter([]string{"m1"}, "")
 	s := newTestServer(local, newStubRouter(nil, ""))
@@ -223,6 +417,12 @@ func TestServer_Unload(t *testing.T) {
 	}
 	if got := local.unloadCalls.Load(); got != 1 {
 		t.Errorf("unloadCalls=%d want 1", got)
+	}
+	if len(local.unloadModels) != 0 {
+		t.Errorf("unloadModels=%v want empty for unload all", local.unloadModels)
+	}
+	if local.unloadTimeout != 0 {
+		t.Errorf("unloadTimeout=%v want 0 (use configured timeouts)", local.unloadTimeout)
 	}
 }
 
@@ -277,8 +477,8 @@ func TestServer_Preload(t *testing.T) {
 		OnStartup: config.HookOnStartup{Preload: []string{"m1"}},
 	}}
 
-	got := make(chan shared.ModelPreloadedEvent, 1)
-	cancel := event.On(func(e shared.ModelPreloadedEvent) { got <- e })
+	got := make(chan swaputil.ModelPreloadedEvent, 1)
+	cancel := event.On(func(e swaputil.ModelPreloadedEvent) { got <- e })
 	defer cancel()
 
 	s.startPreload()
@@ -290,6 +490,31 @@ func TestServer_Preload(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("preload event not received")
+	}
+}
+
+// TestServer_New_OnStartupProfile verifies New activates the configured startup profile.
+func TestServer_New_OnStartupProfile(t *testing.T) {
+	discard := logmon.NewGroup(io.Discard, true, true, true)
+	cfg := config.Config{HealthCheckTimeout: 15}
+	cfg.Profiles = map[string]config.ProfileConfig{
+		"coding": {Pins: map[string]string{"llm-code": "model"}},
+	}
+	cfg.Hooks.OnStartup.Profile = "coding"
+	st, err := sqlite.New("")
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	defer st.Close()
+	s, err := New(cfg, discard, nil, st, BuildInfo{}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("New (startup profile): %v", err)
+	}
+	if got := s.ActiveProfile(); got != "coding" {
+		t.Fatalf("ActiveProfile()=%q want %q", got, "coding")
+	}
+	if err := s.Shutdown(time.Second); err != nil {
+		t.Fatalf("Shutdown: %v", err)
 	}
 }
 
@@ -348,4 +573,44 @@ func TestServer_LogStream_UnknownID_Returns400(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status=%d want 400", w.Code)
 	}
+}
+
+func TestProxy_ConfiguredVoicesOverrideUpstream(t *testing.T) {
+	cfg := config.Config{Models: map[string]config.ModelConfig{
+		"tts":      {Capabilities: config.ModelCapConfig{Voices: []string{"voicea", "voiceb", "voicec"}}},
+		"tts-none": {},
+	}}
+	local := newStubRouter([]string{"tts", "tts-none"}, "upstream")
+	s := newTestServerWithConfig(cfg, local, newStubRouter(nil, ""))
+
+	t.Run("configured voices are returned", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/audio/voices?model=tts", nil))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %q", ct)
+		}
+		var got struct {
+			Voices []string `json:"voices"`
+			Model  string   `json:"model"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Join(got.Voices, ",") != "voicea,voiceb,voicec" || got.Model != "tts" {
+			t.Errorf("unexpected body: %s", w.Body.String())
+		}
+	})
+
+	t.Run("model without voices goes to upstream", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/audio/voices?model=tts-none", nil))
+
+		if w.Body.String() != "upstream" {
+			t.Errorf("body = %q, want upstream", w.Body.String())
+		}
+	})
 }

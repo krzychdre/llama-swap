@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -17,42 +18,50 @@ import (
 )
 
 func TestServer_NewLoggers(t *testing.T) {
-	t.Run("proxy mode routes proxy into muxlog, discards upstream", func(t *testing.T) {
-		mux, proxy, upstream := NewLoggers(config.LogToStdoutProxy)
-		proxy.Info("PROXYLINE")
-		upstream.Info("UPSTREAMLINE")
-		h := string(mux.GetHistory())
-		if !strings.Contains(h, "PROXYLINE") {
-			t.Errorf("muxlog missing proxy line: %q", h)
-		}
-		if strings.Contains(h, "UPSTREAMLINE") {
-			t.Errorf("muxlog should not contain upstream line: %q", h)
-		}
-	})
+	tests := []struct {
+		logToStdout string
+		want        []string // lines expected in the combined log
+		notWant     []string
+	}{
+		{config.LogToStdoutProxy, []string{"PROXYLINE"}, []string{"UPSTREAMLINE", "HTTPLINE"}},
+		{config.LogToStdoutUpstream, []string{"UPSTREAMLINE"}, []string{"PROXYLINE", "HTTPLINE"}},
+		{config.LogToStdoutBoth, []string{"PROXYLINE", "UPSTREAMLINE", "HTTPLINE"}, nil},
+		{config.LogToStdoutNone, nil, []string{"PROXYLINE", "UPSTREAMLINE", "HTTPLINE"}},
+		{"proxy,http", []string{"PROXYLINE", "HTTPLINE"}, []string{"UPSTREAMLINE"}},
+		{"upstream, http", []string{"UPSTREAMLINE", "HTTPLINE"}, []string{"PROXYLINE"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.logToStdout, func(t *testing.T) {
+			logs, err := NewLoggers(tt.logToStdout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logs.ProxyLogs.Info("PROXYLINE")
+			logs.UpstreamLogs.Info("UPSTREAMLINE")
+			logs.HttpLogs.Info("HTTPLINE")
 
-	t.Run("both mode routes proxy and upstream into muxlog", func(t *testing.T) {
-		mux, proxy, upstream := NewLoggers(config.LogToStdoutBoth)
-		proxy.Info("PROXYLINE")
-		upstream.Info("UPSTREAMLINE")
-		h := string(mux.GetHistory())
-		if !strings.Contains(h, "PROXYLINE") || !strings.Contains(h, "UPSTREAMLINE") {
-			t.Errorf("muxlog history = %q", h)
-		}
-	})
+			h := string(logs.MuxLogs.GetHistory())
+			for _, line := range tt.want {
+				if !strings.Contains(h, line) {
+					t.Errorf("combined log missing %s: %q", line, h)
+				}
+			}
+			for _, line := range tt.notWant {
+				if strings.Contains(h, line) {
+					t.Errorf("combined log should not contain %s: %q", line, h)
+				}
+			}
+		})
+	}
 
-	t.Run("none mode discards everything from muxlog", func(t *testing.T) {
-		mux, proxy, upstream := NewLoggers(config.LogToStdoutNone)
-		proxy.Info("PROXYLINE")
-		upstream.Info("UPSTREAMLINE")
-		if len(mux.GetHistory()) != 0 {
-			t.Errorf("muxlog should be empty, got %q", mux.GetHistory())
-		}
-	})
+	if _, err := NewLoggers("proxy,bogus"); err == nil {
+		t.Error("expected an error for an invalid logToStdout value")
+	}
 }
 
 func TestServer_HandleLogs_Plain(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
-	s.muxlog.Write([]byte("a log line"))
+	s.logs.MuxLogs.Write([]byte("a log line"))
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/logs", nil))
@@ -68,6 +77,37 @@ func TestServer_HandleLogs_Plain(t *testing.T) {
 	}
 }
 
+func TestServer_GetLogger(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	for id, want := range map[string]*logmon.Monitor{
+		"":         s.logs.MuxLogs,
+		"proxy":    s.logs.ProxyLogs,
+		"upstream": s.logs.UpstreamLogs,
+		"http":     s.logs.HttpLogs,
+	} {
+		if got, err := s.getLogger(id); err != nil || got != want {
+			t.Errorf("getLogger(%q) = %p, %v; want %p", id, got, err, want)
+		}
+	}
+	if _, err := s.getLogger("bogus"); err == nil {
+		t.Error("getLogger(\"bogus\") should fail")
+	}
+}
+
+// TestServer_RequestLogGoesToHTTPStream checks that access log lines are
+// written to the http stream and not the proxy stream.
+func TestServer_RequestLogGoesToHTTPStream(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if h := string(s.logs.HttpLogs.GetHistory()); !strings.Contains(h, `"GET /health HTTP/1.1" 200`) {
+		t.Errorf("http log missing request line: %q", h)
+	}
+	if h := string(s.logs.ProxyLogs.GetHistory()); strings.Contains(h, "/health") {
+		t.Errorf("proxy log should not contain request line: %q", h)
+	}
+}
+
 func TestServer_HandleLogs_HTMLRedirect(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 
@@ -79,8 +119,8 @@ func TestServer_HandleLogs_HTMLRedirect(t *testing.T) {
 	if w.Code != http.StatusFound {
 		t.Fatalf("status = %d, want 302", w.Code)
 	}
-	if got := w.Header().Get("Location"); got != "/ui/" {
-		t.Errorf("Location = %q, want /ui/", got)
+	if got := w.Header().Get("Location"); got != "ui/" {
+		t.Errorf("Location = %q, want ui/", got)
 	}
 }
 
@@ -95,6 +135,14 @@ func TestServer_ClientIP(t *testing.T) {
 			r.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
 		}, "1.2.3.4"},
 		{"x-real-ip", func(r *http.Request) { r.Header.Set("X-Real-IP", "9.9.9.9") }, "9.9.9.9"},
+		{"x-forwarded-for whitespace-only first entry falls back to x-real-ip", func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", "   , 5.6.7.8")
+			r.Header.Set("X-Real-IP", "9.9.9.9")
+		}, "9.9.9.9"},
+		{"x-forwarded-for empty first entry falls back to remote addr", func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", ",5.6.7.8")
+			r.RemoteAddr = "10.0.0.9:1234"
+		}, "10.0.0.9"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -139,6 +187,134 @@ func TestServer_RequestLogMiddleware(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestServer_RequestLogMiddleware_ClientClosed covers #1029: a client that
+// hangs up before anything is written (e.g. during a cold model load) used to
+// be logged as the seeded 200, hiding aborted requests from status-code
+// monitoring. It must be logged as 499 instead — but only when no response had
+// started.
+func TestServer_RequestLogMiddleware_ClientClosed(t *testing.T) {
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		want    string
+		notWant string
+	}{
+		{
+			// The cold-load cancellation branches in baseRouter.ServeHTTP:
+			// they return without touching the ResponseWriter.
+			name:    "no response written is logged as 499",
+			handler: func(w http.ResponseWriter, r *http.Request) {},
+			want:    "499 0",
+			notWant: "200 0",
+		},
+		{
+			// A response already on the wire keeps the status the client
+			// actually received, even though it hung up mid-stream.
+			name: "response already started keeps its status",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("partial"))
+			},
+			want:    "200 7",
+			notWant: "499",
+		},
+		{
+			// An implicit 200 from a bare Write counts as started too.
+			name: "implicit 200 from Write keeps its status",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte("partial"))
+			},
+			want:    "200 7",
+			notWant: "499",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			proxylog := logmon.NewWriter(io.Discard)
+			ctx, cancel := context.WithCancel(context.Background())
+			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+			r.RemoteAddr = "192.168.1.1:5000"
+			// The client goes away while the handler is still waiting.
+			cancel()
+
+			CreateRequestLogMiddleware(proxylog)(c.handler).ServeHTTP(httptest.NewRecorder(), r)
+
+			line := string(proxylog.GetHistory())
+			if !strings.Contains(line, c.want) {
+				t.Errorf("log line %q missing %q", line, c.want)
+			}
+			if strings.Contains(line, c.notWant) {
+				t.Errorf("log line %q should not contain %q", line, c.notWant)
+			}
+		})
+	}
+
+	// A streaming handler can commit the implicit 200 by flushing alone. The
+	// client has started receiving that response, so a later disconnect must
+	// not rewrite the log line to 499.
+	t.Run("cancellation after Flush keeps the flushed status", func(t *testing.T) {
+		proxylog := logmon.NewWriter(io.Discard)
+		ctx, cancel := context.WithCancel(context.Background())
+		r := httptest.NewRequest(http.MethodGet, "/logs/stream", nil).WithContext(ctx)
+		r.RemoteAddr = "192.168.1.1:5000"
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Establish the stream, then the client goes away mid-stream.
+			w.(http.Flusher).Flush()
+			cancel()
+		})
+		CreateRequestLogMiddleware(proxylog)(handler).ServeHTTP(httptest.NewRecorder(), r)
+
+		line := string(proxylog.GetHistory())
+		if !strings.Contains(line, "200 0") {
+			t.Errorf("log line %q should keep the flushed 200", line)
+		}
+		if strings.Contains(line, "499") {
+			t.Errorf("log line %q must not report 499 after a flushed response", line)
+		}
+	})
+
+	// base.go calls SendError after the loading stream has already sent its
+	// 200 (shutdown, or a dispatch error). net/http drops that second header,
+	// so the client keeps the 200 and the log must report what it received.
+	t.Run("WriteHeader after a started response keeps the first status", func(t *testing.T) {
+		proxylog := logmon.NewWriter(io.Discard)
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		r.RemoteAddr = "192.168.1.1:5000"
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("data: loading\n\n"))
+			// Something fails after the stream has started.
+			w.WriteHeader(http.StatusInternalServerError)
+		})
+
+		rec := httptest.NewRecorder()
+		CreateRequestLogMiddleware(proxylog)(handler).ServeHTTP(rec, r)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("client received %d, want %d", rec.Code, http.StatusOK)
+		}
+		if line := string(proxylog.GetHistory()); !strings.Contains(line, "200 15") {
+			t.Errorf("log line %q should report the 200 the client received", line)
+		}
+	})
+
+	t.Run("live client keeps the seeded 200", func(t *testing.T) {
+		proxylog := logmon.NewWriter(io.Discard)
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		r.RemoteAddr = "192.168.1.1:5000"
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+
+		CreateRequestLogMiddleware(proxylog)(handler).ServeHTTP(httptest.NewRecorder(), r)
+
+		if line := string(proxylog.GetHistory()); !strings.Contains(line, "200 0") {
+			t.Errorf("log line %q should report 200 for a connected client", line)
+		}
+	})
 }
 
 // TestServer_RequestLogMiddleware_WebSocketUpgrade verifies that the access-log

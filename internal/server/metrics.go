@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -15,15 +16,14 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/cache"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
-	"github.com/mostlygeek/llama-swap/internal/metricsdb"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/mostlygeek/llama-swap/internal/tailcat"
 	"github.com/tidwall/gjson"
 )
 
-// TokenMetrics and ActivityLogEntry are canonically defined in metricsdb;
-// aliased here so server code keeps its established names.
-type TokenMetrics = metricsdb.TokenMetrics
-type ActivityLogEntry = metricsdb.Entry
+type TokenMetrics = store.TokenMetrics
+type ActivityLogEntry = store.ActivityLogEntry
 
 // ActivityLogEvent carries a single activity log entry to event subscribers.
 type ActivityLogEvent struct {
@@ -31,39 +31,28 @@ type ActivityLogEvent struct {
 }
 
 func (e ActivityLogEvent) Type() uint32 {
-	return shared.ActivityLogEventID
+	return swaputil.ActivityLogEventID
 }
 
-// metricsMonitor parses upstream responses for token statistics, persists
-// activity entries to the metrics store, and (when captures are enabled)
-// stores zstd+CBOR-compressed request/response captures in a sized cache.
+// metricsMonitor parses upstream responses for token statistics, stores
+// activity in a store, and (when captures are enabled) stores
+// zstd+CBOR-compressed request/response captures in a sized in-memory cache.
 type metricsMonitor struct {
-	store      *metricsdb.Store
-	ownedStore bool // store opened here rather than supplied; closed by close()
-	logger     *logmon.Monitor
-
+	store          store.Store
+	maxMetrics     int
+	logger         *logmon.Monitor
 	enableCaptures bool
 	captureCache   *cache.Cache // zstd-compressed CBOR of ReqRespCapture
 }
 
-// newMetricsMonitor creates a metricsMonitor recording into store. A nil
-// store gets an owned in-memory store retaining up to maxMetrics entries.
-// captureBufferMB is the capture buffer size in megabytes; 0 disables captures.
-func newMetricsMonitor(logger *logmon.Monitor, store *metricsdb.Store, maxMetrics int, captureBufferMB int) *metricsMonitor {
-	ownedStore := false
-	if store == nil {
-		var err error
-		store, err = metricsdb.Open(metricsdb.MemoryPath, metricsdb.Options{MemoryRowCap: maxMetrics, Logger: logger})
-		if err != nil {
-			// An in-memory open cannot fail short of sqlite itself being broken.
-			panic(fmt.Sprintf("opening in-memory metrics store: %v", err))
-		}
-		ownedStore = true
+func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int, st store.Store) *metricsMonitor {
+	if maxMetrics <= 0 {
+		maxMetrics = 1000
 	}
 	mm := &metricsMonitor{
-		store:          store,
-		ownedStore:     ownedStore,
 		logger:         logger,
+		store:          st,
+		maxMetrics:     maxMetrics,
 		enableCaptures: captureBufferMB > 0,
 	}
 	if captureBufferMB > 0 {
@@ -72,14 +61,25 @@ func newMetricsMonitor(logger *logmon.Monitor, store *metricsdb.Store, maxMetric
 	return mm
 }
 
-// queueMetrics persists a metric and returns its database-assigned ID, or -1
-// when the insert failed.
-func (mp *metricsMonitor) queueMetrics(metric ActivityLogEntry) int {
-	id, err := mp.store.Insert(metric)
-	if err != nil && mp.logger != nil {
-		mp.logger.Warnf("metrics: failed to store activity entry: %v", err)
+// queueMetrics persists a metric and returns the store-assigned row. It
+// deliberately does not take the request context: record runs after the
+// handler returns, and an aborted request (canceled context) must still be
+// recorded — that is exactly when the error entry matters.
+func (mp *metricsMonitor) queueMetrics(metric ActivityLogEntry) (ActivityLogEntry, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stored, err := mp.store.Activity().Insert(ctx, metric)
+	if err != nil {
+		mp.warnf("failed to persist activity metric: %v", err)
+		return ActivityLogEntry{}, false
 	}
-	return id
+	if mp.store.IsInMemory() {
+		if err := mp.store.Activity().Prune(ctx, mp.maxMetrics); err != nil {
+			mp.warnf("failed to prune activity metrics: %v", err)
+		}
+	}
+	return stored, true
 }
 
 // emitMetric publishes an ActivityLogEvent for the given metric.
@@ -87,42 +87,51 @@ func (mp *metricsMonitor) emitMetric(metric ActivityLogEntry) {
 	event.Emit(ActivityLogEvent{Metrics: metric})
 }
 
-// metricsPage is the paginated /api/metrics response payload.
-type metricsPage struct {
-	Entries []ActivityLogEntry `json:"entries"`
-	Total   int                `json:"total"`
-	HasMore bool               `json:"has_more"`
-}
-
-// list returns a page of stored metrics, newest first, annotating HasCapture
-// from the in-memory capture cache.
-func (mp *metricsMonitor) list(f metricsdb.ListFilter) (metricsPage, error) {
-	entries, total, hasMore, err := mp.store.List(f)
-	if err != nil {
-		return metricsPage{}, err
-	}
-	if entries == nil {
-		entries = []ActivityLogEntry{}
-	}
-	if mp.captureCache != nil {
+func (mp *metricsMonitor) overlayCaptureState(entries []ActivityLogEntry) {
+	if mp.captureCache == nil {
 		for i := range entries {
-			entries[i].HasCapture = mp.captureCache.Has(entries[i].ID)
+			entries[i].HasCapture = false
 		}
+		return
 	}
-	return metricsPage{Entries: entries, Total: total, HasMore: hasMore}, nil
+	for i := range entries {
+		entries[i].HasCapture = mp.captureCache.Has(entries[i].ID)
+	}
 }
 
-// summary returns SQL-computed aggregates over the filtered range.
-func (mp *metricsMonitor) summary(model string, from, to time.Time) (metricsdb.Summary, error) {
-	return mp.store.Summary(model, from, to)
+func (mp *metricsMonitor) warnf(format string, args ...any) {
+	if mp.logger != nil {
+		mp.logger.Warnf(format, args...)
+	}
 }
 
-// close releases the owned in-memory store, if any. Externally supplied
-// stores outlive the server (they are owned by main and survive reloads).
-func (mp *metricsMonitor) close() {
-	if mp.ownedStore {
-		mp.store.Close()
+func (mp *metricsMonitor) debugf(format string, args ...any) {
+	if mp.logger != nil {
+		mp.logger.Debugf(format, args...)
 	}
+}
+
+func (mp *metricsMonitor) Close() error {
+	return nil
+}
+
+// activitySource returns connection metadata for activity records. It
+// prefers Tailcat's authenticated source, then falls back to the
+// X-Forwarded-For/X-Real-IP headers (prefixed with "xff:" since a proxy
+// header is client-supplied and can be spoofed), and finally the raw
+// connection address.
+func activitySource(r *http.Request) string {
+	if source, ok := tailcat.SourceFromContext(r.Context()); ok {
+		return source
+	}
+	if ip, ok := forwardedIP(r); ok {
+		return "xff:" + ip
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return "ip:" + host
 }
 
 // record parses a completed response body and stores/emits an activity entry.
@@ -140,24 +149,51 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		RespStatusCode:  recorder.Status(),
 		DurationMs:      int(time.Since(recorder.StartTime()).Milliseconds()),
 	}
+	tm.Src = activitySource(r)
 
-	if ctxData, ok := shared.ReadContext(r.Context()); ok && len(ctxData.Metadata) > 0 {
+	if ctxData, ok := swaputil.ReadContext(r.Context()); ok && len(ctxData.Metadata) > 0 {
 		tm.Metadata = make(map[string]string, len(ctxData.Metadata))
 		for k, v := range ctxData.Metadata {
 			tm.Metadata[k] = v
 		}
 	}
+	if selectorID := selectorFromContext(r.Context()); selectorID != "" {
+		if tm.Metadata == nil {
+			tm.Metadata = make(map[string]string)
+		}
+		tm.Metadata["selector"] = selectorID
+	}
 
 	queueAndEmit := func() {
-		tm.ID = mp.queueMetrics(tm)
+		stored, ok := mp.queueMetrics(tm)
+		if !ok {
+			return
+		}
+		tm = stored
 		mp.emitMetric(tm)
+	}
+
+	// A client that hangs up is normal traffic, not a server fault: record the
+	// entry so the abort is visible, but at debug level and without the
+	// synthesized upstream error message the failure path below would attach.
+	// No capture is stored — there is no response to inspect, and a client
+	// retrying in a loop would otherwise flood the capture store. See #1029.
+	if recorder.Status() == swaputil.StatusClientClosedRequest {
+		mp.debugf("metrics: client disconnected before response, path=%s", r.URL.Path)
+		tm.ErrorMsg = "client disconnected before response"
+		queueAndEmit()
+		return
 	}
 
 	if recorder.Status() != http.StatusOK {
 		mp.logger.Warnf("non-200 response, recording partial metrics: status=%d, path=%s", recorder.Status(), r.URL.Path)
 		decoded, decErr := mp.decodeResponseBody(recorder, r.URL.Path)
 		tm.ErrorMsg = failedErrorMessage(recorder.Status(), decoded, decErr)
-		tm.ID = mp.queueMetrics(tm)
+		stored, ok := mp.queueMetrics(tm)
+		if !ok {
+			return
+		}
+		tm = stored
 		// Capture the request only; the failure is surfaced via ErrorMsg
 		// rather than storing the (possibly undisplayable) response body.
 		tm.HasCapture = mp.storeCapture(tm.ID, r, recorder, cf&^captureRespBody, reqBody, reqHeaders, nil)
@@ -194,6 +230,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		parsed := gjson.ParseBytes(body)
 		usage := parsed.Get("usage")
 		timings := parsed.Get("timings")
+		responseMetrics := parsed.Get("metrics")
 
 		// /infill responses are arrays; timings live in the last element (#463).
 		if strings.HasPrefix(r.URL.Path, "/infill") {
@@ -202,8 +239,8 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 			}
 		}
 
-		if usage.Exists() || timings.Exists() {
-			if parsedMetrics, err := parseMetrics(modelID, recorder.StartTime(), usage, timings); err != nil {
+		if usage.Exists() || timings.Exists() || responseMetrics.Exists() {
+			if parsedMetrics, err := parseMetrics(modelID, recorder.StartTime(), usage, timings, responseMetrics); err != nil {
 				mp.logger.Warnf("error parsing metrics: %v, path=%s, recording minimal metrics", err, r.URL.Path)
 			} else {
 				tm.Tokens = parsedMetrics.Tokens
@@ -214,7 +251,11 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		mp.logger.Warnf("metrics: invalid JSON in response body path=%s, recording minimal metrics", r.URL.Path)
 	}
 
-	tm.ID = mp.queueMetrics(tm)
+	stored, ok := mp.queueMetrics(tm)
+	if !ok {
+		return
+	}
+	tm = stored
 	tm.HasCapture = mp.storeCapture(tm.ID, r, recorder, cf, reqBody, reqHeaders, body)
 	mp.emitMetric(tm)
 }
@@ -224,8 +265,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 // capture (already decompressed by the caller); pass nil to omit it. Returns
 // true if a capture was stored.
 func (mp *metricsMonitor) storeCapture(id int, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string, body []byte) bool {
-	// id < 0 means the entry failed to persist; a capture would be unreachable.
-	if !mp.enableCaptures || id < 0 {
+	if !mp.enableCaptures {
 		return false
 	}
 	capture := ReqRespCapture{
@@ -362,7 +402,9 @@ func processStreamingResponse(modelID string, start, firstToken, lastToken time.
 		cachedTokens              int64 = -1
 		cachedInInput             bool
 		hasAny                    bool
+		usage                     gjson.Result
 		timings                   gjson.Result
+		responseMetrics           gjson.Result
 	)
 
 	prefix := []byte("data:")
@@ -410,9 +452,16 @@ func processStreamingResponse(modelID string, start, firstToken, lastToken time.
 				cachedTokens = c
 				cachedInInput = cInInput
 			}
+			// Remember the last usage block so buildMetrics can read the
+			// backend rates it embeds there.
+			usage = u
 		}
 		if t := parsed.Get("timings"); t.Exists() {
 			timings = t
+			hasAny = true
+		}
+		if m := parsed.Get("metrics"); m.Exists() {
+			responseMetrics = m
 			hasAny = true
 		}
 	}
@@ -421,29 +470,54 @@ func processStreamingResponse(modelID string, start, firstToken, lastToken time.
 		return ActivityLogEntry{}, fmt.Errorf("no valid JSON data found in stream")
 	}
 
-	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, cachedInInput, timings, firstToken, lastToken), nil
+	return buildMetrics(modelID, start, inputTokens, outputTokens, cachedTokens, cachedInInput, usage, timings, responseMetrics, firstToken, lastToken), nil
 }
 
-func parseMetrics(modelID string, start time.Time, usage, timings gjson.Result) (ActivityLogEntry, error) {
+func parseMetrics(modelID string, start time.Time, usage, timings, responseMetrics gjson.Result) (ActivityLogEntry, error) {
 	input, output, cached, cachedInInput, _ := extractUsageTokens(usage)
-	// Non-streaming responses have no per-token stream timing, so rates are only
-	// available when the backend supplies llama.cpp timings.
-	return buildMetrics(modelID, start, input, output, cached, cachedInInput, timings, time.Time{}, time.Time{}), nil
+	// Non-streaming responses have no per-token stream timing.
+	return buildMetrics(modelID, start, input, output, cached, cachedInInput, usage, timings, responseMetrics, time.Time{}, time.Time{}), nil
 }
 
 // buildMetrics composes an ActivityLogEntry from accumulated token counts and
-// optional llama-server timings (which override input/output and provide rates).
-// For streaming backends that omit timings (e.g. vllm), firstToken/lastToken
+// optional llama-server timings (which override input/output and provide rates)
+// or vLLM response metrics (rates and speculative decoding counters). TabbyAPI
+// and oMLX embed rates in the usage block, which supplies base rates
+// when timings and metrics are absent. For streaming backends that report none
+// of these (e.g. vllm without per-request metrics), firstToken/lastToken
 // bracket the generated stream so rates can be derived from the proxy's own
 // timing; they are zero for non-streaming responses. cachedInInput indicates
 // that cachedTokens is counted inside inputTokens (OpenAI-style usage).
-func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, cachedInInput bool, timings gjson.Result, firstToken, lastToken time.Time) ActivityLogEntry {
+func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, cachedTokens int64, cachedInInput bool, usage, timings, responseMetrics gjson.Result, firstToken, lastToken time.Time) ActivityLogEntry {
 	wallDurationMs := int(time.Since(start).Milliseconds())
 	durationMs := wallDurationMs
 	tokensPerSecond := -1.0
 	promptPerSecond := -1.0
 	draftTokens := -1
 	draftAccTokens := -1
+
+	// TabbyAPI reports prompt/completion rates and total time inside its usage
+	// block. These are base values that llama-server timings and vLLM metrics
+	// override when present.
+	if usage.Exists() {
+		if v := usage.Get("prompt_tokens_per_sec"); v.Exists() && v.Type != gjson.Null {
+			promptPerSecond = v.Float()
+		} else if v := usage.Get("prompt_tokens_per_second"); v.Type == gjson.Number {
+			// oMLX reports prompt throughput using the long-form suffix.
+			promptPerSecond = v.Float()
+		}
+		if v := usage.Get("completion_tokens_per_sec"); v.Exists() && v.Type != gjson.Null {
+			tokensPerSecond = v.Float()
+		} else if v := usage.Get("generation_tokens_per_second"); v.Type == gjson.Number {
+			// oMLX calls completion throughput generation throughput.
+			tokensPerSecond = v.Float()
+		}
+		if v := usage.Get("total_time"); v.Exists() {
+			if totalTimeMs := int(v.Float() * 1000); totalTimeMs > durationMs {
+				durationMs = totalTimeMs
+			}
+		}
+	}
 
 	if timings.Exists() {
 		inputTokens = timings.Get("prompt_n").Int()
@@ -461,11 +535,36 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 			draftTokens = int(timings.Get("draft_n").Int())
 			draftAccTokens = int(timings.Get("draft_n_accepted").Int())
 		}
-	} else if !firstToken.IsZero() && lastToken.After(firstToken) {
-		// Derive rates from stream timing: start..firstToken approximates prompt
-		// processing (queue + prefill); firstToken..lastToken brackets the
-		// generation of the remaining output tokens.
-		if genSecs := lastToken.Sub(firstToken).Seconds(); genSecs > 0 && outputTokens > 1 {
+	}
+	// vLLM reports speculative decoding counts under metrics.speculative_decoding
+	// when started with --per-request-spec-decode-metrics (#1032). Both counters
+	// are required so the acceptance rate is never derived from a half-filled
+	// object.
+	if spec := responseMetrics.Get("speculative_decoding"); spec.Exists() {
+		drafted := spec.Get("num_draft_tokens")
+		accepted := spec.Get("num_accepted_draft_tokens")
+		if drafted.Exists() && accepted.Exists() {
+			draftTokens = int(drafted.Int())
+			draftAccTokens = int(accepted.Int())
+		}
+	}
+	if timeToFirstToken := responseMetrics.Get("time_to_first_token_ms"); timeToFirstToken.Exists() && timeToFirstToken.Float() > 0 {
+		cachedForRate := cachedTokens
+		if cachedForRate < 0 {
+			cachedForRate = 0
+		}
+		promptPerSecond = float64(inputTokens-cachedForRate) / (timeToFirstToken.Float() / 1000)
+	}
+	if meanInterTokenLatency := responseMetrics.Get("mean_itl_ms"); meanInterTokenLatency.Exists() && meanInterTokenLatency.Float() > 0 {
+		tokensPerSecond = 1000 / meanInterTokenLatency.Float()
+	}
+
+	// Streaming backends that report no rates at all (e.g. vllm without
+	// per-request metrics) get them derived from the proxy's stream timing:
+	// start..firstToken approximates prompt processing (queue + prefill);
+	// firstToken..lastToken brackets the generation of the remaining tokens.
+	if !firstToken.IsZero() && lastToken.After(firstToken) {
+		if genSecs := lastToken.Sub(firstToken).Seconds(); tokensPerSecond < 0 && genSecs > 0 && outputTokens > 1 {
 			tokensPerSecond = float64(outputTokens-1) / genSecs
 		}
 		// Prompt speed must count only tokens actually prefilled. OpenAI-style
@@ -476,12 +575,12 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 		if cachedInInput && cachedTokens > 0 {
 			prefillTokens -= cachedTokens
 		}
-		if ttftSecs := firstToken.Sub(start).Seconds(); ttftSecs > 0 && prefillTokens > 0 {
+		if ttftSecs := firstToken.Sub(start).Seconds(); promptPerSecond < 0 && ttftSecs > 0 && prefillTokens > 0 {
 			promptPerSecond = float64(prefillTokens) / ttftSecs
 		}
 	}
 
-	// Fallback: when neither llama.cpp timings nor usable per-token stream timing
+	// Fallback: when no backend rates and no usable per-token stream timing
 	// are available - e.g. an upstream that buffers the whole response before
 	// sending it (so firstWrite == lastWrite), or a non-streaming response -
 	// approximate generation throughput from the wall-clock duration. This is
@@ -598,11 +697,31 @@ func (w *responseBodyCopier) WriteHeader(statusCode int) {
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
+// MarkStatus records code for metrics without writing to the client, and
+// forwards to the wrapped writer so the access-log recorder agrees.
+func (w *responseBodyCopier) MarkStatus(code int) {
+	w.status = code
+	if marker, ok := w.ResponseWriter.(swaputil.StatusMarker); ok {
+		marker.MarkStatus(code)
+	}
+}
+
+// WroteHeader reports whether a response status reached the client.
+func (w *responseBodyCopier) WroteHeader() bool { return w.wroteHeader }
+
 // Flush forwards to the underlying writer so streaming responses still flush.
 func (w *responseBodyCopier) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
+	f, ok := w.ResponseWriter.(http.Flusher)
+	if !ok {
+		return
 	}
+	// Flushing commits the implicit 200, so the response has started even if
+	// nothing wrote a header. Recorded here for the same reason as in
+	// statusRecorder: the client-closed sentinel must not overwrite it.
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	f.Flush()
 }
 
 // Hijack forwards to the underlying writer so httputil.ReverseProxy can take

@@ -23,12 +23,25 @@ import (
 //go:embed index.html
 var loadingPageHTML string
 
+//go:embed confirm.html
+var confirmPageHTML string
+
+// wakePath is the endpoint the confirmation page posts to when -require-confirm is set
+const wakePath = "/wol-wake"
+
+// wake durations longer than this are discarded, they most likely mean the
+// wake failed and the upstream was started some other way much later
+const maxTrackedWake = 10 * time.Minute
+
 var (
 	flagMac      = flag.String("mac", "", "mac address to send WoL packet to")
 	flagUpstream = flag.String("upstream", "", "upstream proxy address to send requests to")
 	flagListen   = flag.String("listen", ":8080", "listen address to listen on")
 	flagLog      = flag.String("log", "info", "log level (debug, info, warn, error)")
 	flagTimeout  = flag.Int("timeout", 60, "seconds requests wait for upstream response before failing")
+	flagAPIKey   = flag.String("api-key", "", "API key sent as Bearer token to the upstream SSE endpoint (falls back to LLAMA_SWAP_API_KEY env var)")
+
+	flagRequireConfirm = flag.Bool("require-confirm", false, "do not wake the upstream automatically; the root page asks for confirmation first and other requests return an error")
 )
 
 func main() {
@@ -83,7 +96,12 @@ func main() {
 		}
 	}
 
-	proxy := newProxy(upstreamURL)
+	apiKey := *flagAPIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("LLAMA_SWAP_API_KEY")
+	}
+
+	proxy := newProxy(upstreamURL, apiKey)
 	server := &http.Server{
 		Addr:    *flagListen,
 		Handler: proxy,
@@ -106,8 +124,12 @@ func main() {
 type upstreamStatus string
 
 const (
-	notready upstreamStatus = "not ready"
-	ready    upstreamStatus = "ready"
+	notready              upstreamStatus = "not ready"
+	ready                 upstreamStatus = "ready"
+	initialReconnectDelay                = 100 * time.Millisecond
+	maxReconnectDelay                    = 10 * time.Second
+	healthCheckInterval                  = 10 * time.Second
+	healthCheckTimeout                   = 5 * time.Second
 )
 
 type proxyServer struct {
@@ -115,15 +137,25 @@ type proxyServer struct {
 	failCount     int
 	statusMutex   sync.RWMutex
 	status        upstreamStatus
+	sseBodyMu     sync.Mutex
+	sseBody       io.Closer
+
+	// guarded by statusMutex
+	wakeStart time.Time     // when the pending wake began, zero if none
+	lastWake  time.Duration // how long the last wake took, zero if unknown
 }
 
-func newProxy(url *url.URL) *proxyServer {
-	p := httputil.NewSingleHostReverseProxy(url)
-	proxy := &proxyServer{
-		upstreamProxy: p,
+func newProxyServer(url *url.URL) *proxyServer {
+	return &proxyServer{
+		upstreamProxy: httputil.NewSingleHostReverseProxy(url),
 		status:        notready,
 		failCount:     0,
 	}
+}
+
+// newProxy creates a proxy and starts the goroutines that watch the upstream
+func newProxy(url *url.URL, apiKey string) *proxyServer {
+	proxy := newProxyServer(url)
 
 	// start a goroutine to monitor upstream status via SSE
 	go func() {
@@ -132,9 +164,13 @@ func newProxy(url *url.URL) *proxyServer {
 			Timeout: 0, // No timeout for SSE connection
 		}
 
-		waitDuration := 10 * time.Second
+		reconnectDelay := time.Duration(0)
 
 		for {
+			if reconnectDelay > 0 {
+				time.Sleep(reconnectDelay)
+			}
+
 			slog.Debug("connecting to SSE endpoint", "url", eventsUrl)
 
 			req, err := http.NewRequest("GET", eventsUrl, nil)
@@ -142,20 +178,23 @@ func newProxy(url *url.URL) *proxyServer {
 				slog.Warn("failed to create SSE request", "error", err)
 				proxy.setStatus(notready)
 				proxy.incFail(1)
-				time.Sleep(waitDuration)
+				reconnectDelay = nextReconnectDelay(reconnectDelay)
 				continue
 			}
 
 			req.Header.Set("Accept", "text/event-stream")
 			req.Header.Set("Cache-Control", "no-cache")
 			req.Header.Set("Connection", "keep-alive")
+			if apiKey != "" {
+				req.Header.Set("Authorization", "Bearer "+apiKey)
+			}
 
 			resp, err := client.Do(req)
 			if err != nil {
 				slog.Error("failed to connect to SSE endpoint", "error", err)
 				proxy.setStatus(notready)
 				proxy.incFail(1)
-				time.Sleep(10 * time.Second)
+				reconnectDelay = nextReconnectDelay(reconnectDelay)
 				continue
 			}
 
@@ -165,7 +204,7 @@ func newProxy(url *url.URL) *proxyServer {
 				_ = resp.Body.Close()
 				proxy.setStatus(notready)
 				proxy.incFail(1)
-				time.Sleep(10 * time.Second)
+				reconnectDelay = nextReconnectDelay(reconnectDelay)
 				continue
 			}
 
@@ -173,6 +212,8 @@ func newProxy(url *url.URL) *proxyServer {
 			slog.Info("connected to SSE endpoint, upstream ready")
 			proxy.setStatus(ready)
 			proxy.resetFailures()
+			reconnectDelay = 0
+			proxy.setSSEBody(resp.Body)
 
 			// Read from the SSE stream to detect disconnection
 			scanner := bufio.NewScanner(resp.Body)
@@ -198,17 +239,52 @@ func newProxy(url *url.URL) *proxyServer {
 			}
 
 			// Connection closed or error occurred
+			proxy.setSSEBody(nil)
 			_ = resp.Body.Close()
 			slog.Info("SSE connection closed, upstream not ready")
 			proxy.setStatus(notready)
 			proxy.incFail(1)
 
-			// Wait before reconnecting
-			time.Sleep(waitDuration)
+		}
+	}()
+
+	// start a goroutine that periodically checks upstream liveness so a
+	// silently dead connection (e.g. upstream suspended without a TCP close)
+	// is detected and the upstream is marked not ready again
+	go func() {
+		healthUrl := url.Scheme + "://" + url.Host + "/wol-health"
+		client := &http.Client{Timeout: healthCheckTimeout}
+		ticker := time.NewTicker(healthCheckInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			resp, err := client.Get(healthUrl)
+			if err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				continue
+			}
+			slog.Warn("upstream health check failed, marking upstream not ready", "error", err)
+			proxy.setStatus(notready)
+			proxy.incFail(1)
+			if c := proxy.takeSSEBody(); c != nil {
+				_ = c.Close() // force the SSE monitor to reconnect
+			}
 		}
 	}()
 
 	return proxy
+}
+
+func nextReconnectDelay(current time.Duration) time.Duration {
+	if current == 0 {
+		return initialReconnectDelay
+	}
+
+	next := current * 2
+	if next > maxReconnectDelay {
+		return maxReconnectDelay
+	}
+	return next
 }
 
 func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -222,6 +298,17 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if *flagRequireConfirm && r.URL.Path == wakePath {
+		switch r.Method {
+		case http.MethodPost:
+			p.handleWake(w, r)
+			return
+		case http.MethodGet:
+			p.handleWakeProgress(w, r)
+			return
+		}
+	}
+
 	if p.getStatus() == notready {
 		path := r.URL.Path
 		if strings.HasPrefix(path, "/api/events") {
@@ -230,7 +317,22 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if *flagRequireConfirm {
+			// never wake the upstream without the user's consent
+			if path == "/" || strings.HasPrefix(path, "/ui/") {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, confirmPageHTML)
+				return
+			}
+
+			slog.Info("upstream not ready, confirmation required", "req", path, "from", r.RemoteAddr)
+			http.Error(w, "upstream is not running, open the root page to confirm starting it", http.StatusServiceUnavailable)
+			return
+		}
+
 		slog.Info("upstream not ready, sending magic packet", "req", path, "from", r.RemoteAddr)
+		p.beginWake()
 		if err := sendMagicPacket(*flagMac); err != nil {
 			slog.Warn("failed to send magic WoL packet", "error", err)
 		}
@@ -266,6 +368,73 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.upstreamProxy.ServeHTTP(w, r)
 }
 
+// handleWake sends the WoL packet after the user confirmed on the confirmation
+// page. It redirects to a GET page so the browser never has to re-submit the
+// form when the loading page reloads itself.
+func (p *proxyServer) handleWake(w http.ResponseWriter, r *http.Request) {
+	if p.getStatus() == ready {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	slog.Info("start confirmed, sending magic packet", "from", r.RemoteAddr)
+	p.beginWake()
+	if err := sendMagicPacket(*flagMac); err != nil {
+		slog.Warn("failed to send magic WoL packet", "error", err)
+	}
+
+	http.Redirect(w, r, wakePath, http.StatusSeeOther)
+}
+
+// handleWakeProgress shows the loading page while a confirmed wake is pending.
+// Without a pending wake there is nothing to wait for, so it goes back to the
+// root page.
+func (p *proxyServer) handleWakeProgress(w http.ResponseWriter, r *http.Request) {
+	if p.getStatus() == ready || !p.wakePending() {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, p.loadingPage())
+}
+
+// loadingPage returns the loading page with the duration of the last wake, so
+// the progress bar can estimate how long this one will take
+func (p *proxyServer) loadingPage() string {
+	last := p.lastWakeDuration()
+	if last <= 0 {
+		return loadingPageHTML // no estimate yet
+	}
+	expected := fmt.Sprintf(`data-expected="%.1f"`, last.Seconds())
+	return strings.Replace(loadingPageHTML, `data-expected="0"`, expected, 1)
+}
+
+// beginWake marks the start of a wake, the first request of a wake wins
+func (p *proxyServer) beginWake() {
+	p.statusMutex.Lock()
+	defer p.statusMutex.Unlock()
+	if p.status == ready {
+		return // came up in the meantime, nothing to time
+	}
+	if p.wakeStart.IsZero() || time.Since(p.wakeStart) > maxTrackedWake {
+		p.wakeStart = time.Now()
+	}
+}
+
+func (p *proxyServer) wakePending() bool {
+	p.statusMutex.RLock()
+	defer p.statusMutex.RUnlock()
+	return !p.wakeStart.IsZero()
+}
+
+func (p *proxyServer) lastWakeDuration() time.Duration {
+	p.statusMutex.RLock()
+	defer p.statusMutex.RUnlock()
+	return p.lastWake
+}
+
 func (p *proxyServer) getStatus() upstreamStatus {
 	p.statusMutex.RLock()
 	defer p.statusMutex.RUnlock()
@@ -276,6 +445,14 @@ func (p *proxyServer) setStatus(status upstreamStatus) {
 	p.statusMutex.Lock()
 	defer p.statusMutex.Unlock()
 	p.status = status
+
+	if status == ready && !p.wakeStart.IsZero() {
+		if d := time.Since(p.wakeStart); d <= maxTrackedWake {
+			p.lastWake = d
+			slog.Info("upstream ready after wake", "took", d.Round(100*time.Millisecond))
+		}
+		p.wakeStart = time.Time{}
+	}
 }
 
 func (p *proxyServer) incFail(num int) {
@@ -294,6 +471,20 @@ func (p *proxyServer) resetFailures() {
 	p.statusMutex.Lock()
 	defer p.statusMutex.Unlock()
 	p.failCount = 0
+}
+
+func (p *proxyServer) setSSEBody(c io.Closer) {
+	p.sseBodyMu.Lock()
+	defer p.sseBodyMu.Unlock()
+	p.sseBody = c
+}
+
+func (p *proxyServer) takeSSEBody() io.Closer {
+	p.sseBodyMu.Lock()
+	defer p.sseBodyMu.Unlock()
+	c := p.sseBody
+	p.sseBody = nil
+	return c
 }
 
 func sendMagicPacket(macAddr string) error {

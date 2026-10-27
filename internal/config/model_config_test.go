@@ -73,6 +73,62 @@ models:
 	}
 }
 
+func TestConfig_ComfyUIOverrides(t *testing.T) {
+	if ComfyUIModelID != "comfyui_auto" {
+		t.Fatalf("ComfyUIModelID=%q want comfyui_auto", ComfyUIModelID)
+	}
+
+	tests := []struct {
+		name             string
+		concurrencyLimit int
+		wantLimit        int
+	}{
+		{name: "unset limit", wantLimit: 999},
+		{name: "lower limit", concurrencyLimit: 10, wantLimit: 999},
+		{name: "minimum limit", concurrencyLimit: 999, wantLimit: 999},
+		{name: "higher limit", concurrencyLimit: 1500, wantLimit: 1500},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := fmt.Sprintf(`
+models:
+  %s:
+    cmd: comfyui --port ${PORT}
+    concurrencyLimit: %d
+    compat:
+      ignoreWebsockets: false
+  regular:
+    cmd: regular --port ${PORT}
+    concurrencyLimit: 10
+`, ComfyUIModelID, tt.concurrencyLimit)
+			cfg, err := LoadConfigFromReader(strings.NewReader(content))
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantLimit, cfg.Models[ComfyUIModelID].ConcurrencyLimit)
+			assert.True(t, cfg.Models[ComfyUIModelID].Compat.IgnoreWebsockets)
+			assert.Equal(t, 10, cfg.Models["regular"].ConcurrencyLimit)
+			assert.False(t, cfg.Models["regular"].Compat.IgnoreWebsockets)
+		})
+	}
+}
+
+func TestConfig_ModelCompat(t *testing.T) {
+	content := `
+models:
+  enabled:
+    cmd: enabled --port ${PORT}
+    compat:
+      ignoreWebsockets: true
+  default:
+    cmd: default --port ${PORT}
+`
+
+	cfg, err := LoadConfigFromReader(strings.NewReader(content))
+	assert.NoError(t, err)
+	assert.True(t, cfg.Models["enabled"].Compat.IgnoreWebsockets)
+	assert.False(t, cfg.Models["default"].Compat.IgnoreWebsockets)
+}
+
 func TestConfig_SetParamsByIDAutoAlias(t *testing.T) {
 	content := `
 models:
@@ -164,7 +220,7 @@ models:
 	assert.Equal(t, []string{"top_k"}, stripParams)
 
 	// Check setParams
-	setParams, keys := modelConfig.Filters.SanitizedSetParams()
+	setParams, keys, _ := modelConfig.Filters.SanitizedSetParams()
 	assert.NotNil(t, setParams)
 	assert.Equal(t, []string{"stop", "temperature", "top_p"}, keys)
 	assert.Equal(t, 0.7, setParams["temperature"])
@@ -291,25 +347,64 @@ func TestConfig_ModelCapabilities_Validate(t *testing.T) {
 		assert.NoError(t, caps.Validate())
 	})
 
+	t.Run("video_input_modality", func(t *testing.T) {
+		caps := ModelCapConfig{
+			In:      []string{"text", "image", "video"},
+			Out:     []string{"text", "audio"},
+			Tools:   true,
+			Context: 100000,
+		}
+		assert.NoError(t, caps.Validate())
+	})
+
+	t.Run("video_output_modality", func(t *testing.T) {
+		// `video` is added to the shared modality set, so it is valid on `out`
+		// as well as `in`. Asserted explicitly so that stays a decision rather
+		// than a side effect of the two lists sharing one map.
+		caps := ModelCapConfig{Out: []string{"video"}}
+		assert.NoError(t, caps.Validate())
+	})
+
+	t.Run("decisions_output_modality", func(t *testing.T) {
+		caps := ModelCapConfig{In: []string{"text", "image"}, Out: []string{"decisions"}}
+		assert.NoError(t, caps.Validate())
+	})
+
+	t.Run("decisions_is_output_only", func(t *testing.T) {
+		caps := ModelCapConfig{In: []string{"decisions"}}
+		err := caps.Validate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "capabilities.in")
+		assert.Contains(t, err.Error(), "decisions")
+	})
+
+	t.Run("video_with_other_modalities", func(t *testing.T) {
+		caps := ModelCapConfig{
+			In:  []string{"text", "image", "video"},
+			Out: []string{"text", "video"},
+		}
+		assert.NoError(t, caps.Validate())
+	})
+
 	t.Run("empty_is_valid", func(t *testing.T) {
 		caps := ModelCapConfig{}
 		assert.NoError(t, caps.Validate())
 	})
 
 	t.Run("invalid_in_modality", func(t *testing.T) {
-		caps := ModelCapConfig{In: []string{"video"}}
+		caps := ModelCapConfig{In: []string{"foo"}}
 		err := caps.Validate()
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "capabilities.in")
-		assert.Contains(t, err.Error(), "video")
+		assert.Contains(t, err.Error(), "foo")
 	})
 
 	t.Run("invalid_out_modality", func(t *testing.T) {
-		caps := ModelCapConfig{Out: []string{"video"}}
+		caps := ModelCapConfig{Out: []string{"foo"}}
 		err := caps.Validate()
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "capabilities.out")
-		assert.Contains(t, err.Error(), "video")
+		assert.Contains(t, err.Error(), "foo")
 	})
 
 	t.Run("negative_context", func(t *testing.T) {
@@ -327,10 +422,284 @@ models:
     capabilities:
       in:
         - text
-        - video
+        - foo
 `
 		_, err := LoadConfigFromReader(strings.NewReader(content))
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "video")
+		assert.Contains(t, err.Error(), "foo")
 	})
+
+	t.Run("video_accepted_at_load", func(t *testing.T) {
+		content := `
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+    capabilities:
+      in:
+        - text
+        - image
+        - video
+      out:
+        - text
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+
+		mc := config.Models["model1"]
+		assert.Equal(t, []string{"text", "image", "video"}, mc.Capabilities.In)
+		assert.Equal(t, []string{"text"}, mc.Capabilities.Out)
+	})
+}
+
+func TestConfig_ModelCapabilities_MacroResolution(t *testing.T) {
+	t.Run("context from global macro", func(t *testing.T) {
+		content := `
+macros:
+  default_ctx: 98304
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+    capabilities:
+      in:
+        - text
+        - image
+      out:
+        - text
+      tools: true
+      context: ${default_ctx}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+
+		mc := config.Models["model1"]
+		assert.False(t, mc.Capabilities.Empty())
+		assert.Equal(t, []string{"text", "image"}, mc.Capabilities.In)
+		assert.Equal(t, []string{"text"}, mc.Capabilities.Out)
+		assert.True(t, mc.Capabilities.Tools)
+		assert.Equal(t, 98304, mc.Capabilities.Context)
+	})
+
+	t.Run("context from model macro overrides global", func(t *testing.T) {
+		content := `
+macros:
+  default_ctx: 4096
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+    macros:
+      default_ctx: 65536
+    capabilities:
+      context: ${default_ctx}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+
+		mc := config.Models["model1"]
+		assert.Equal(t, 65536, mc.Capabilities.Context)
+	})
+
+	t.Run("macro in modalities", func(t *testing.T) {
+		content := `
+macros:
+  img_modality: image
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+    capabilities:
+      in:
+        - text
+        - ${img_modality}
+      out:
+        - text
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+
+		mc := config.Models["model1"]
+		assert.Equal(t, []string{"text", "image"}, mc.Capabilities.In)
+	})
+
+	t.Run("macro in tools", func(t *testing.T) {
+		content := `
+macros:
+  has_tools: true
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+    capabilities:
+      tools: ${has_tools}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+
+		mc := config.Models["model1"]
+		assert.True(t, mc.Capabilities.Tools)
+	})
+
+	t.Run("macro in reranker", func(t *testing.T) {
+		content := `
+macros:
+  is_reranker: true
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+    capabilities:
+      reranker: ${is_reranker}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+
+		mc := config.Models["model1"]
+		assert.True(t, mc.Capabilities.Reranker)
+	})
+
+	t.Run("quoted direct macros preserve scalar types", func(t *testing.T) {
+		content := `
+macros:
+  default_ctx: 32768
+  has_tools: true
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+    capabilities:
+      context: "${default_ctx}"
+      tools: "${has_tools}"
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+
+		mc := config.Models["model1"]
+		assert.Equal(t, 32768, mc.Capabilities.Context)
+		assert.True(t, mc.Capabilities.Tools)
+	})
+
+	t.Run("no capabilities block is unchanged", func(t *testing.T) {
+		content := `
+macros:
+  default_ctx: 98304
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+
+		mc := config.Models["model1"]
+		assert.True(t, mc.Capabilities.Empty())
+	})
+
+	t.Run("unknown macro in capabilities errors", func(t *testing.T) {
+		content := `
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+    capabilities:
+      context: ${undefined_macro}
+`
+		_, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "capabilities: unknown macro '${undefined_macro}'")
+	})
+}
+
+func TestConfig_ModelCapabilities_Merge(t *testing.T) {
+	auto := ModelCapConfig{
+		In:       []string{"text", "image"},
+		Out:      []string{"text"},
+		Tools:    true,
+		Reranker: true,
+		Context:  4096,
+	}
+
+	t.Run("fills_every_unset_field", func(t *testing.T) {
+		merged := ModelCapConfig{}.Merge(auto)
+		assert.Equal(t, auto.In, merged.In)
+		assert.Equal(t, auto.Out, merged.Out)
+		assert.True(t, merged.Tools)
+		assert.True(t, merged.Reranker)
+		assert.Equal(t, 4096, merged.Context)
+	})
+
+	t.Run("configured_fields_win", func(t *testing.T) {
+		configured := ModelCapConfig{
+			In:      []string{"text"},
+			Context: 32000,
+		}
+		merged := configured.Merge(auto)
+		assert.Equal(t, []string{"text"}, merged.In, "configured in wins")
+		assert.Equal(t, 32000, merged.Context, "configured context wins")
+		assert.Equal(t, []string{"text"}, merged.Out, "unset out comes from auto")
+		assert.True(t, merged.Tools, "unset tools comes from auto")
+	})
+
+	t.Run("per_field_not_whole_block", func(t *testing.T) {
+		// The vllm case: only context is discoverable, and a hand written
+		// tools flag must not suppress it.
+		merged := ModelCapConfig{Tools: true}.Merge(ModelCapConfig{Context: 8192})
+		assert.True(t, merged.Tools)
+		assert.Equal(t, 8192, merged.Context)
+	})
+
+	t.Run("false_cannot_override_discovered_true", func(t *testing.T) {
+		// Documented limitation: a zero value is indistinguishable from an
+		// omitted one, so disableAuto is the escape hatch, not `tools: false`.
+		merged := ModelCapConfig{Tools: false}.Merge(ModelCapConfig{Tools: true})
+		assert.True(t, merged.Tools)
+	})
+
+	t.Run("empty_auto_changes_nothing", func(t *testing.T) {
+		configured := ModelCapConfig{In: []string{"text"}, Context: 512}
+		merged := configured.Merge(ModelCapConfig{})
+		assert.Equal(t, configured, merged)
+	})
+
+	t.Run("keeps_disable_auto_from_config", func(t *testing.T) {
+		merged := ModelCapConfig{DisableAuto: true}.Merge(auto)
+		assert.True(t, merged.DisableAuto)
+	})
+
+	t.Run("does_not_mutate_the_receiver", func(t *testing.T) {
+		configured := ModelCapConfig{}
+		_ = configured.Merge(auto)
+		assert.True(t, configured.Empty(), "Merge must return a copy")
+	})
+}
+
+func TestConfig_ModelCapabilities_EmptyIgnoresDisableAuto(t *testing.T) {
+	assert.True(t, ModelCapConfig{DisableAuto: true}.Empty(),
+		"a block that only disables discovery advertises nothing")
+	assert.False(t, ModelCapConfig{DisableAuto: true, Tools: true}.Empty())
+}
+
+func TestConfig_ModelCapabilities_DisableAutoParsesFromYAML(t *testing.T) {
+	content := `
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+    capabilities:
+      disableAuto: true
+`
+	config, err := LoadConfigFromReader(strings.NewReader(content))
+	assert.NoError(t, err)
+
+	mc := config.Models["model1"]
+	assert.True(t, mc.Capabilities.DisableAuto)
+	assert.True(t, mc.Capabilities.Empty(), "disableAuto alone is still an empty block")
+}
+
+func TestConfig_ModelCapabilities_Voices(t *testing.T) {
+	content := `
+models:
+  tts:
+    cmd: path/to/cmd --port ${PORT}
+    capabilities:
+      voices: ["voicea", "voiceb", "voicec"]
+`
+	config, err := LoadConfigFromReader(strings.NewReader(content))
+	assert.NoError(t, err)
+
+	caps := config.Models["tts"].Capabilities
+	assert.Equal(t, []string{"voicea", "voiceb", "voicec"}, caps.Voices)
+	assert.True(t, caps.Empty(), "voices are not advertised in /v1/models")
+	assert.Equal(t, caps.Voices, caps.Merge(ModelCapConfig{Tools: true}).Voices)
 }

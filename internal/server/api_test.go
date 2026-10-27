@@ -8,11 +8,12 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 func TestServer_HandleListModels(t *testing.T) {
@@ -35,8 +36,10 @@ func TestServer_HandleListModels(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "http://example.com" {
-		t.Errorf("Access-Control-Allow-Origin = %q", got)
+	// The global CORS middleware sets this on every response now, so the
+	// listing no longer echoes the request Origin back.
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q want *", got)
 	}
 
 	var resp struct {
@@ -49,11 +52,54 @@ func TestServer_HandleListModels(t *testing.T) {
 	for _, m := range resp.Data {
 		ids[m.ID] = true
 	}
-	if !ids["visible"] || !ids["remote-model"] {
+	if !ids["visible"] || !ids["peer1/remote-model"] {
 		t.Errorf("missing expected models: %v", ids)
 	}
 	if ids["hidden"] {
 		t.Error("unlisted model should not appear")
+	}
+}
+
+func TestServer_HandleListModels_PeerNamespaces(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		Models: map[string]config.ModelConfig{"shared": {}},
+		Peers: config.PeerDictionaryConfig{
+			"cuda":  {Models: []string{"shared"}},
+			"strix": {Models: []string{"shared"}},
+		},
+	}
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	var resp struct {
+		Data []modelRecord `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ids := make(map[string]bool)
+	for _, model := range resp.Data {
+		ids[model.ID] = true
+	}
+	for _, id := range []string{"shared", "cuda/shared", "strix/shared"} {
+		if !ids[id] {
+			t.Errorf("missing model %q from %v", id, ids)
+		}
+	}
+	if len(ids) != 3 {
+		t.Errorf("model IDs = %v, want exactly local and two qualified peers", ids)
+	}
+
+	statusIDs := make(map[string]bool)
+	for _, model := range s.modelStatus() {
+		statusIDs[model.Id] = true
+	}
+	for _, id := range []string{"shared", "cuda/shared", "strix/shared"} {
+		if !statusIDs[id] {
+			t.Errorf("missing status model %q from %v", id, statusIDs)
+		}
 	}
 }
 
@@ -82,6 +128,50 @@ func TestServer_HandleListModels_Aliases(t *testing.T) {
 	}
 }
 
+func TestServer_HandleListModels_Status(t *testing.T) {
+	local := newStubRouter(nil, "")
+	local.running = map[string]process.ProcessState{"loaded-model": process.StateReady}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		IncludeAliasesInList: true,
+		Models: map[string]config.ModelConfig{
+			"loaded-model":   {Aliases: []string{"loaded-alias"}},
+			"unloaded-model": {},
+		},
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {Models: []string{"remote-model"}},
+		},
+	}
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	var resp struct {
+		Data []modelRecord `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	statuses := map[string]string{}
+	for _, m := range resp.Data {
+		statuses[m.ID], _ = m.Status["value"].(string)
+	}
+
+	if statuses["loaded-model"] != "loaded" {
+		t.Errorf("loaded-model status = %q, want loaded", statuses["loaded-model"])
+	}
+	if statuses["loaded-alias"] != "loaded" {
+		t.Errorf("loaded-alias status = %q, want loaded", statuses["loaded-alias"])
+	}
+	if statuses["unloaded-model"] != "unloaded" {
+		t.Errorf("unloaded-model status = %q, want unloaded", statuses["unloaded-model"])
+	}
+	if statuses["peer1/remote-model"] != "unloaded" {
+		t.Errorf("peer1/remote-model status = %q, want unloaded", statuses["peer1/remote-model"])
+	}
+}
+
 func TestServer_FindModelInPath(t *testing.T) {
 	cfg := config.Config{Models: map[string]config.ModelConfig{
 		"author":       {},
@@ -103,7 +193,7 @@ func TestServer_FindModelInPath(t *testing.T) {
 		{"/", "", "", false},
 	}
 	for _, c := range cases {
-		name, _, rem, found := shared.FindModelInPath(cfg, c.path)
+		name, _, rem, found := swaputil.FindModelInPath(cfg, c.path)
 		if found != c.wantFound || name != c.wantName || (found && rem != c.wantRem) {
 			t.Errorf("FindModelInPath(%q) = (%q,%q,%v), want (%q,%q,%v)",
 				c.path, name, rem, found, c.wantName, c.wantRem, c.wantFound)
@@ -130,6 +220,17 @@ func TestServer_HandleUpstream(t *testing.T) {
 		if w.Code != http.StatusMovedPermanently {
 			t.Errorf("status = %d, want 301", w.Code)
 		}
+		if got := w.Header().Get("Location"); got != "./m1/" {
+			t.Errorf("Location = %q, want ./m1/", got)
+		}
+	})
+
+	t.Run("preserves query string", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1?token=abc", nil))
+		if got := w.Header().Get("Location"); got != "./m1/?token=abc" {
+			t.Errorf("Location = %q, want ./m1/?token=abc", got)
+		}
 	})
 
 	t.Run("unknown model 404", func(t *testing.T) {
@@ -141,18 +242,118 @@ func TestServer_HandleUpstream(t *testing.T) {
 	})
 }
 
-func upstreamMetricsServer(response string) *Server {
+// TestServer_HandleUpstreamRedirect_TrailingSlash covers the bare-model
+// trailing-slash redirect for names whose echoed form would break the
+// relative Location: slash names (a bare "author/model/" resolves against
+// /upstream/author/, doubling the path) and colon aliases (a bare
+// "model1:high/" parses as a URL scheme, not a path).
+func TestServer_HandleUpstreamRedirect_TrailingSlash(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  author/model:
+    cmd: echo ${PORT}
+  model1:
+    cmd: echo ${PORT}
+    aliases: [model1:high]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(cfg, newStubRouter([]string{"author/model", "model1"}, "ok"), newStubRouter(nil, ""))
+
+	tests := []struct {
+		name   string
+		method string
+		target string
+		code   int
+		loc    string
+	}{
+		{"slash name two segments", http.MethodGet, "/upstream/author/model", http.StatusMovedPermanently, "./model/"},
+		{"slash name escaped segment", http.MethodGet, "/upstream/author%2Fmodel", http.StatusMovedPermanently, "./author%2Fmodel/"},
+		{"colon alias", http.MethodGet, "/upstream/model1:high", http.StatusMovedPermanently, "./model1:high/"},
+		{"colon alias non-GET", http.MethodPost, "/upstream/model1:high", http.StatusPermanentRedirect, "./model1:high/"},
+		{"colon alias with query", http.MethodGet, "/upstream/model1:high?prompt=hi", http.StatusMovedPermanently, "./model1:high/?prompt=hi"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, httptest.NewRequest(tt.method, tt.target, nil))
+			if w.Code != tt.code {
+				t.Errorf("status = %d, want %d", w.Code, tt.code)
+			}
+			if got := w.Header().Get("Location"); got != tt.loc {
+				t.Errorf("Location = %q, want %q", got, tt.loc)
+			}
+		})
+	}
+}
+func TestProxy_HandleUpstreamPreservesEscapedPath(t *testing.T) {
+	tests := []struct {
+		name   string
+		models []string
+		target string
+		want   string
+	}{
+		{
+			name:   "encoded slash in resource path",
+			models: []string{"m1"},
+			target: "/upstream/m1/api/userdata/workflows%2Fexample.json",
+			want:   "/api/userdata/workflows%2Fexample.json",
+		},
+		{
+			name:   "multi-segment model name",
+			models: []string{"author/model"},
+			target: "/upstream/author/model/api/x%2Fy",
+			want:   "/api/x%2Fy",
+		},
+		{
+			name:   "encoded separator in multi-segment model name",
+			models: []string{"author/model"},
+			target: "/upstream/author%2Fmodel/api/x%2Fy",
+			want:   "/api/x%2Fy",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			local := newStubRouter(tt.models, "")
+			var got string
+			local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+				got = r.URL.EscapedPath()
+				w.WriteHeader(http.StatusOK)
+			}
+			s := newTestServer(local, newStubRouter(nil, ""))
+			models := make(map[string]config.ModelConfig, len(tt.models))
+			for _, model := range tt.models {
+				models[model] = config.ModelConfig{}
+			}
+			s.cfg = config.Config{Models: models}
+			s.routes()
+
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, tt.target, nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body=%q)", w.Code, w.Body.String())
+			}
+			if got != tt.want {
+				t.Errorf("upstream escaped path = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func upstreamMetricsServer(t *testing.T, response string) *Server {
+	t.Helper()
 	cfg := config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
-	proxylog := logmon.NewWriter(io.Discard)
+	logs := logmon.NewGroup(io.Discard, true, true, true)
+	proxylog := logs.ProxyLogs
 	s := &Server{
-		cfg:         cfg,
-		muxlog:      logmon.NewWriter(io.Discard),
-		proxylog:    proxylog,
-		upstreamlog: logmon.NewWriter(io.Discard),
-		inflight:    newInflightTracker(),
-		metrics:     newMetricsMonitor(proxylog, nil, 10, 0),
-		local:       newStubRouter([]string{"m1"}, response),
-		peer:        newStubRouter(nil, ""),
+		cfg:      cfg,
+		logs:     logs,
+		inflight: newInflightTracker(),
+		metrics:  newTestMetricsMonitor(t, proxylog, 10, 0),
+		local:    newStubRouter([]string{"m1"}, response),
+		peer:     newStubRouter(nil, ""),
 	}
 	s.routes()
 	return s
@@ -245,7 +446,7 @@ func TestServer_HandleUpstream_IgnorePaths(t *testing.T) {
 
 func TestServer_HandleUpstream_MetricsRecordsSupportedPath(t *testing.T) {
 	resp := `{"usage":{"prompt_tokens":3,"completion_tokens":5}}`
-	s := upstreamMetricsServer(resp)
+	s := upstreamMetricsServer(t, resp)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/upstream/m1/v1/chat/completions", strings.NewReader(`{}`))
@@ -255,7 +456,7 @@ func TestServer_HandleUpstream_MetricsRecordsSupportedPath(t *testing.T) {
 	if w.Code != http.StatusOK || w.Body.String() != resp {
 		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
 	}
-	entries := s.metrics.getMetrics()
+	entries := metricsEntries(t, s.metrics)
 	if len(entries) != 1 {
 		t.Fatalf("want 1 metrics entry, got %d", len(entries))
 	}
@@ -271,7 +472,7 @@ func TestServer_HandleUpstream_MetricsRecordsSupportedPath(t *testing.T) {
 }
 
 func TestServer_HandleUpstream_MetricsSkipsUnsupportedPath(t *testing.T) {
-	s := upstreamMetricsServer("ok")
+	s := upstreamMetricsServer(t, "ok")
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/upstream/m1/probe", strings.NewReader(`{}`))
@@ -281,13 +482,13 @@ func TestServer_HandleUpstream_MetricsSkipsUnsupportedPath(t *testing.T) {
 	if w.Code != http.StatusOK || w.Body.String() != "ok" {
 		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
 	}
-	if len(s.metrics.getMetrics()) != 0 {
-		t.Errorf("want no metrics entries for unsupported path, got %d", len(s.metrics.getMetrics()))
+	if len(metricsEntries(t, s.metrics)) != 0 {
+		t.Errorf("want no metrics entries for unsupported path, got %d", len(metricsEntries(t, s.metrics)))
 	}
 }
 
 func TestServer_HandleUpstream_MetricsSkipsGET(t *testing.T) {
-	s := upstreamMetricsServer(`{"usage":{}}`)
+	s := upstreamMetricsServer(t, `{"usage":{}}`)
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1/v1/chat/completions", nil))
@@ -295,8 +496,8 @@ func TestServer_HandleUpstream_MetricsSkipsGET(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d", w.Code)
 	}
-	if len(s.metrics.getMetrics()) != 0 {
-		t.Errorf("want no metrics entries for GET upstream, got %d", len(s.metrics.getMetrics()))
+	if len(metricsEntries(t, s.metrics)) != 0 {
+		t.Errorf("want no metrics entries for GET upstream, got %d", len(metricsEntries(t, s.metrics)))
 	}
 }
 
@@ -323,13 +524,13 @@ func TestServer_HandleUpstream_InflightTracksSupportedPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			local := newStubRouter([]string{"m1"}, "ok")
 			var s *Server
-			var during shared.InFlightRequestsEvent
+			var during swaputil.InFlightRequestsEvent
 			local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
 				during = s.inflight.Current()
 				w.WriteHeader(http.StatusOK)
 				w.Write([]byte("ok"))
 			}
-			s = upstreamInflightServer(local)
+			s = upstreamInflightServer(t, local, config.ModelConfig{})
 
 			w := httptest.NewRecorder()
 			s.ServeHTTP(w, httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`)))
@@ -353,13 +554,13 @@ func TestServer_HandleUpstream_InflightTracksSupportedPaths(t *testing.T) {
 func TestServer_HandleUpstream_InflightSkipsUnsupportedPath(t *testing.T) {
 	local := newStubRouter([]string{"m1"}, "ok")
 	var s *Server
-	var during shared.InFlightRequestsEvent
+	var during swaputil.InFlightRequestsEvent
 	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
 		during = s.inflight.Current()
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	}
-	s = upstreamInflightServer(local)
+	s = upstreamInflightServer(t, local, config.ModelConfig{})
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/upstream/m1/probe", strings.NewReader(`{}`)))
@@ -371,18 +572,41 @@ func TestServer_HandleUpstream_InflightSkipsUnsupportedPath(t *testing.T) {
 	}
 }
 
-func upstreamInflightServer(local *stubRouter) *Server {
-	cfg := config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
-	proxylog := logmon.NewWriter(io.Discard)
+func TestServer_HandleUpstream_InflightIgnoresConfiguredWebsocket(t *testing.T) {
+	local := newStubRouter([]string{"m1"}, "ok")
+	var s *Server
+	var during swaputil.InFlightRequestsEvent
+	local.serveHTTP = func(w http.ResponseWriter, _ *http.Request) {
+		during = s.inflight.Current()
+		w.WriteHeader(http.StatusSwitchingProtocols)
+	}
+	s = upstreamInflightServer(t, local, config.ModelConfig{
+		Compat: config.CompatConfig{IgnoreWebsockets: true},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/upstream/m1/props", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	if len(during.Requests) != 0 {
+		t.Fatalf("inflight during ignored websocket = %+v, want empty", during)
+	}
+}
+
+func upstreamInflightServer(t *testing.T, local *stubRouter, mc config.ModelConfig) *Server {
+	t.Helper()
+	cfg := config.Config{Models: map[string]config.ModelConfig{"m1": mc}}
+	logs := logmon.NewGroup(io.Discard, true, true, true)
+	proxylog := logs.ProxyLogs
 	s := &Server{
-		cfg:         cfg,
-		muxlog:      logmon.NewWriter(io.Discard),
-		proxylog:    proxylog,
-		upstreamlog: logmon.NewWriter(io.Discard),
-		inflight:    newInflightTracker(),
-		metrics:     newMetricsMonitor(proxylog, nil, 10, 0),
-		local:       local,
-		peer:        newStubRouter(nil, ""),
+		cfg:      cfg,
+		logs:     logs,
+		inflight: newInflightTracker(),
+		metrics:  newTestMetricsMonitor(t, proxylog, 10, 0),
+		local:    local,
+		peer:     newStubRouter(nil, ""),
 	}
 	s.routes()
 	return s
@@ -401,7 +625,7 @@ func TestServer_HandleMetrics_Unavailable(t *testing.T) {
 func TestServer_Redirects(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 
-	for path, want := range map[string]string{"/": "/ui", "/upstream": "/ui/models"} {
+	for path, want := range map[string]string{"/": "ui/", "/upstream": "ui/#/models"} {
 		w := httptest.NewRecorder()
 		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
 		if w.Code != http.StatusFound {
@@ -471,6 +695,9 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 		if m.ContextLength != 100000 {
 			t.Errorf("context_length = %d", m.ContextLength)
 		}
+		if m.ContextWindow != 100000 {
+			t.Errorf("context_window = %d", m.ContextWindow)
+		}
 	})
 
 	t.Run("in_only", func(t *testing.T) {
@@ -494,6 +721,9 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 		}
 		if m.ContextLength != 0 {
 			t.Error("should not have context_length")
+		}
+		if m.ContextWindow != 0 {
+			t.Error("should not have context_window")
 		}
 	})
 
@@ -546,6 +776,9 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 		if m.ContextLength != 32768 {
 			t.Errorf("context_length = %d", m.ContextLength)
 		}
+		if m.ContextWindow != 32768 {
+			t.Errorf("context_window = %d", m.ContextWindow)
+		}
 		if m.Architecture != nil {
 			t.Error("should not have architecture")
 		}
@@ -592,6 +825,9 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 		if m.ContextLength != 0 {
 			t.Error("should not have context_length")
 		}
+		if m.ContextWindow != 0 {
+			t.Error("should not have context_window")
+		}
 	})
 
 	t.Run("metadata_precedence", func(t *testing.T) {
@@ -601,6 +837,7 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 				"architecture":   "should-be-dropped",
 				"custom_field":   "should-remain",
 				"capabilities":   "also-dropped",
+				"context_window": "also-dropped",
 				"other_metadata": "also-remain",
 			},
 		}))
@@ -617,6 +854,9 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 		if _, ok := meta["custom_field"]; !ok {
 			t.Error("custom_field should remain in metadata")
 		}
+		if _, ok := meta["context_window"]; ok {
+			t.Error("context_window should be filtered from metadata when caps are set")
+		}
 	})
 
 	t.Run("metadata_passthrough_no_caps", func(t *testing.T) {
@@ -625,6 +865,7 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 				"architecture":   "preserved",
 				"context_length": 4096,
 				"capabilities":   "preserved",
+				"context_window": 8192,
 				"custom_field":   "preserved",
 			},
 		}))
@@ -641,7 +882,125 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 		if _, ok := meta["context_length"]; !ok {
 			t.Error("context_length should be preserved in metadata when caps is empty")
 		}
+		if _, ok := meta["context_window"]; !ok {
+			t.Error("context_window should be preserved in metadata when caps is empty")
+		}
 	})
+}
+
+// TestServer_ModelStatus_Capabilities verifies the /api/events modelStatus
+// payload carries capability booleans and context_length for configured models.
+// The Models list reads both from this SSE payload.
+func TestServer_ModelStatus_Capabilities(t *testing.T) {
+	newServer := func(mc config.ModelConfig) *Server {
+		s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+		s.cfg = config.Config{Models: map[string]config.ModelConfig{"m": mc}}
+		return s
+	}
+
+	t.Run("renders capabilities and context", func(t *testing.T) {
+		s := newServer(config.ModelConfig{
+			Capabilities: config.ModelCapConfig{
+				In:      []string{"text", "image"},
+				Tools:   true,
+				Context: 128000,
+			},
+		})
+		status := s.modelStatus()
+		if len(status) != 1 {
+			t.Fatalf("expected 1 model, got %d", len(status))
+		}
+		m := status[0]
+		if m.Id != "m" {
+			t.Errorf("id = %q, want m", m.Id)
+		}
+		if m.Capabilities == nil || m.Capabilities["vision"] != true {
+			t.Errorf("vision = %v", m.Capabilities)
+		}
+		if m.Capabilities["function_calling"] != true {
+			t.Errorf("function_calling = %v", m.Capabilities["function_calling"])
+		}
+		if m.ContextLength != 128000 {
+			t.Errorf("context_length = %d, want 128000", m.ContextLength)
+		}
+	})
+
+	t.Run("omits capabilities when empty", func(t *testing.T) {
+		s := newServer(config.ModelConfig{})
+		m := s.modelStatus()[0]
+		if m.Capabilities != nil {
+			t.Errorf("expected no capabilities, got %v", m.Capabilities)
+		}
+		if m.ContextLength != 0 {
+			t.Errorf("expected no context_length, got %d", m.ContextLength)
+		}
+	})
+}
+
+func TestServer_ModelStatus_ReadySince(t *testing.T) {
+	since := time.Date(2026, 9, 25, 6, 41, 37, 0, time.UTC)
+	local := newStubRouter(nil, "")
+	local.running = map[string]process.ProcessState{
+		"ready":    process.StateReady,
+		"stopping": process.StateStopping,
+	}
+	// stopping still has a timestamp to check that only ready models report it.
+	local.readySince = map[string]time.Time{"ready": since, "stopping": since}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{
+		"ready": {}, "stopping": {}, "stopped": {},
+	}}
+
+	got := make(map[string]string)
+	uptime := make(map[string]int64)
+	for _, m := range s.modelStatus() {
+		got[m.Id] = m.ReadySince
+		uptime[m.Id] = m.UptimeMs
+	}
+	if want := time.Since(since).Milliseconds(); uptime["ready"] < want-1000 || uptime["ready"] > want+1000 {
+		t.Errorf("ready uptimeMs = %d, want about %d", uptime["ready"], want)
+	}
+	if uptime["stopping"] != 0 || uptime["stopped"] != 0 {
+		t.Errorf("uptimeMs = %v, want 0 for models that are not ready", uptime)
+	}
+	want := map[string]string{
+		"ready":    "2026-09-25T06:41:37Z",
+		"stopping": "",
+		"stopped":  "",
+	}
+	for id, w := range want {
+		if got[id] != w {
+			t.Errorf("%s readySince = %q, want %q", id, got[id], w)
+		}
+	}
+}
+
+func TestServer_ModelStatus_LoadingProgress(t *testing.T) {
+	progress := 0.4
+	lp := &process.LoadingProgress{Progress: &progress, Message: "loading tensors"}
+	local := newStubRouter(nil, "")
+	local.running = map[string]process.ProcessState{
+		"starting": process.StateStarting,
+		"ready":    process.StateReady,
+	}
+	// ready still has progress to check that only starting models report it.
+	local.loading = map[string]*process.LoadingProgress{"starting": lp, "ready": lp}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{
+		"starting": {}, "ready": {}, "stopped": {},
+	}}
+
+	for _, m := range s.modelStatus() {
+		if m.Id == "starting" {
+			if m.LoadingProgress == nil || *m.LoadingProgress != progress || m.LoadingMessage != "loading tensors" {
+				t.Errorf("starting: progress = %v, message = %q, want %v and %q", m.LoadingProgress, m.LoadingMessage, progress, "loading tensors")
+			}
+			continue
+		}
+		if m.LoadingProgress != nil || m.LoadingMessage != "" {
+			t.Errorf("%s: progress = %v, message = %q, want neither", m.Id, m.LoadingProgress, m.LoadingMessage)
+		}
+	}
 }
 
 func stringSliceEqual(a, b []string) bool {

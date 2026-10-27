@@ -1,6 +1,7 @@
 package process
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -29,59 +30,60 @@ func sleepWakeConfig(t *testing.T, enabled bool) config.ModelConfig {
 	}
 }
 
-func waitForState(t *testing.T, p *ProcessCommand, want ProcessState) {
-	t.Helper()
-	deadline := time.Now().Add(testStartTimeout)
-	for time.Now().Before(deadline) {
-		if p.State() == want {
-			return
-		}
-		time.Sleep(testPollInterval)
-	}
-	t.Fatalf("timed out waiting for state %s, got %s", want, p.State())
-}
-
 // TestProcessCommand_SleepWake exercises the full sleep → wake → serve cycle on
 // a sleep/wake-enabled model. The subprocess stays alive across the cycle.
+// EnsureReady is how the router wakes a sleeping model during a swap.
 func TestProcessCommand_SleepWake(t *testing.T) {
 	skipIfNoSimpleResponder(t)
 
-	p := newProcessCommand(t, sleepWakeConfig(t, true))
-	t.Cleanup(func() { p.Stop(testStopTimeout) })
+	wakers := map[string]func(p *ProcessCommand) error{
+		"Wake":        func(p *ProcessCommand) error { return p.Wake(testStartTimeout) },
+		"EnsureReady": func(p *ProcessCommand) error { return p.EnsureReady(context.Background(), testStartTimeout) },
+	}
+	for name, wake := range wakers {
+		t.Run(name, func(t *testing.T) {
+			p := newProcessCommand(t, sleepWakeConfig(t, true))
+			t.Cleanup(func() { p.Stop(testStopTimeout) })
 
-	runErr := runAsync(t, p)
-	if got := p.State(); got != StateReady {
-		t.Fatalf("after Run: expected %s, got %s", StateReady, got)
-	}
+			runErr := runAsync(t, p)
+			if got := p.State(); got != StateReady {
+				t.Fatalf("after Run: expected %s, got %s", StateReady, got)
+			}
 
-	// Sleep frees VRAM but keeps the process alive.
-	if err := p.Sleep(testStopTimeout); err != nil {
-		t.Fatalf("Sleep: %v", err)
-	}
-	if got := p.State(); got != StateSleeping {
-		t.Fatalf("after Sleep: expected %s, got %s", StateSleeping, got)
-	}
+			// Sleep frees VRAM but keeps the process alive.
+			if err := p.Sleep(testStopTimeout); err != nil {
+				t.Fatalf("Sleep: %v", err)
+			}
+			if got := p.State(); got != StateSleeping {
+				t.Fatalf("after Sleep: expected %s, got %s", StateSleeping, got)
+			}
 
-	// Run is still parked (process never terminated).
-	select {
-	case err := <-runErr:
-		t.Fatalf("Run returned while sleeping: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
+			// Run is still parked (process never terminated).
+			select {
+			case err := <-runErr:
+				t.Fatalf("Run returned while sleeping: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
 
-	// Wake restores readiness.
-	if err := p.Wake(testStartTimeout); err != nil {
-		t.Fatalf("Wake: %v", err)
-	}
-	if got := p.State(); got != StateReady {
-		t.Fatalf("after Wake: expected %s, got %s", StateReady, got)
-	}
+			if err := wake(p); err != nil {
+				t.Fatalf("wake: %v", err)
+			}
+			if got := p.State(); got != StateReady {
+				t.Fatalf("after wake: expected %s, got %s", StateReady, got)
+			}
 
-	// The process serves traffic again.
-	rr := httptest.NewRecorder()
-	p.ServeHTTP(rr, httptest.NewRequest("GET", "/test", nil))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("after Wake: expected 200, got %d", rr.Code)
+			// The same process serves traffic again; Run was never released.
+			rr := httptest.NewRecorder()
+			p.ServeHTTP(rr, httptest.NewRequest("GET", "/test", nil))
+			if rr.Code != http.StatusOK {
+				t.Fatalf("after wake: expected 200, got %d", rr.Code)
+			}
+			select {
+			case err := <-runErr:
+				t.Fatalf("Run returned after wake: %v", err)
+			default:
+			}
+		})
 	}
 }
 

@@ -108,9 +108,10 @@ slow. The two are reconciled by doing the slow part on a separate goroutine.
 When the scheduler decides to start a swap, inside `OnRequest` it:
 
 1. records "a swap for X is in flight" in its own state, then
-2. calls `Effects.StartSwap(modelID, evict)`.
+2. calls `Effects.StartSwap(modelID, generation, evict)` and stores the returned
+   cancellation function.
 
-`StartSwap` does **not** load the model itself — it just launches a detached
+`StartSwap` does **not** load the model itself — it just launches a cancellable
 goroutine (`doSwap`) and returns straight away. `doSwap` is what does the slow
 work: stop the evicted processes, start the target, wait for it to become ready.
 Because `StartSwap` returned immediately, `OnRequest` returns too, and the run
@@ -122,6 +123,31 @@ finishes it posts a `SwapDone` onto `swapDoneCh`, which the run loop delivers as
 `OnSwapDone`. So a slow load never blocks the run loop; it brackets it with two
 quick events (`OnRequest` to start, `OnSwapDone` to finish) and everything in
 between is handled normally.
+
+Each swap has a unique generation, carried in its `SwapDone`. The scheduler
+ignores completions that do not match the active generation. Before unloading
+a target, it cancels and joins that target's swap so the old goroutine cannot
+restart the process after it has been stopped. Cancellation also releases a
+goroutine waiting to send its completion, without needing the run loop to
+receive it.
+
+### `doSwap` never decides from a process state snapshot
+
+To start the target, `doSwap` calls a single `process.EnsureReady`. It
+deliberately does **not** read `State()` and branch on the result. Processes
+change state on their own — a TTL unload, a crash, an operator kill — so any
+state the router reads is already stale by the time it acts on it. `EnsureReady`
+takes that decision inside the process's own single-writer run loop, where the
+state is owned: ready is a no-op, stopped starts, and a stop still in flight
+holds the request until it finishes and then starts.
+
+This is the rule that matters when extending the router: **advisory reads of
+process state are fine** (which model to evict, what `/running` reports — being
+slightly stale is harmless there), but **a read that gates a mutation is a bug**.
+Move that decision into the process instead. Getting this wrong is what caused
+issue #946: a request arriving during a TTL unload saw `StateStopping`, skipped
+the start, and then waited forever on a process nobody was going to start —
+which wedged that model's swap slot and hung every later request for it.
 
 ### In-flight tracking and `trackedServe`
 
@@ -198,7 +224,7 @@ than in `EvictionFor`.
 type Effects interface {
     ModelState(modelID string) (process.ProcessState, bool)
     RunningModels() map[string]process.ProcessState
-    StartSwap(modelID string, evict []string)
+    StartSwap(modelID string, generation uint64, evict []string) func()
     GrantError(req HandlerReq, err error)
     GrantServe(req HandlerReq, modelID string) bool
     StopProcesses(timeout time.Duration, ids []string)
@@ -252,7 +278,7 @@ type HandlerResp struct {           // the decision handed back to the caller
     Err        error                // ...fail with this
 }
 
-type SwapDone        struct{ ModelID string; Err error } // swap goroutine finished
+type SwapDone        struct{ ModelID string; Generation uint64; Err error } // swap goroutine finished
 type ServeDoneEvent  struct{ ModelID string }            // tracked handler returned
 ```
 
@@ -279,17 +305,18 @@ Method by method, as implemented in `base.go`:
   state, and whether this router handles the model at all. The scheduler uses it
   for the "unknown model" check and the "already ready" fast path. Safe to call
   any time because the process map is fixed at construction and `State()` is a
-  snapshot.
+  snapshot. Advisory only — never branch a start or stop on it (see above).
 
 - **`RunningModels()`** — the state of every process that isn't stopped or shut
   down. The scheduler unions its keys with its own in-flight swap targets to
   build the `running` set it hands the `Swapper`, so the swapper never has to
   touch process state itself.
 
-- **`StartSwap(modelID, evict)`** — fire-and-forget. `baseRouter` launches the
+- **`StartSwap(modelID, generation, evict)`** — `baseRouter` launches the
   `doSwap` goroutine and returns immediately; the result comes back later as a
-  `SwapDone`. The scheduler records the swap as active _before_ calling this so
-  that requests arriving in the meantime can join it.
+  `SwapDone` with the same generation. The returned function cancels and joins
+  the goroutine. The scheduler records the swap as active _before_ calling this
+  so that requests arriving in the meantime can join it.
 
 - **`GrantError(req, err)`** — hand a caller an error response. Used for unknown
   models, failed swaps, unloads, and shutdown.
@@ -367,13 +394,13 @@ What each method must do:
 
 - **`OnRequest(req)`** — every request must resolve to exactly one of: granted, errored, joined (piggybacks an in-flight swap), queued, or swap-started. No request may be silently dropped.
 
-- **`OnSwapDone(ev)`** — deliver the result to every waiter that joined this swap (grant on success, error on `ev.Err`), drop the swap from active tracking, then re-examine anything queued — a finished swap may have unblocked it.
+- **`OnSwapDone(ev)`** — ignore a completion whose generation does not match the active swap. Otherwise, release its cancellation resources, deliver the result to every waiter that joined this swap (grant on success, error on `ev.Err`), drop the swap from active tracking, then re-examine anything queued — a finished swap may have unblocked it.
 
 - **`OnServeDone(ev)`** — decrement the model's in-flight count; when it hits zero, re-examine the queue. Do **not** clear in-flight counts by hand; the handlers post their own `ServeDoneEvent`s on return.
 
-- **`OnUnload(targets, timeout)`** — error out any waiters or queued requests for the unloaded models, call `Effects.StopProcesses` (synchronously — the admin caller relies on the process being dead afterwards), then re-examine the queue.
+- **`OnUnload(targets, timeout)`** — cancel and join swaps targeting the unloaded models, error out their waiters or queued requests, call `Effects.StopProcesses` (synchronously — the admin caller relies on the process being dead afterwards), then re-examine the queue.
 
-- **`OnShutdown(err)`** — error out every waiter you still hold (active swap waiters and queued requests). Don't touch processes; teardown is `baseRouter`'s job.
+- **`OnShutdown(err)`** — cancel and join active swaps, then error out every waiter you still hold (active swap waiters and queued requests). Don't touch processes; teardown is `baseRouter`'s job.
 
 Expose a constructor matching the `Factory` shape:
 

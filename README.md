@@ -12,8 +12,7 @@ Built in Go for performance and simplicity, llama-swap has zero dependencies and
 ## Features:
 
 - ✅ Easy to deploy and configure: one binary, one configuration file. no external dependencies
-- ✅ On-demand model switching
-- ✅ Use any local OpenAI compatible server (llama.cpp, vllm, tabbyAPI, stable-diffusion.cpp, etc.)
+- ✅ On-demand model switching for many local AI servers (llama.cpp + forks, vllm, stable-diffusion.cpp, audio.cpp, ComfyUI, etc.)
   - future proof, upgrade your inference servers at any time.
 - ✅ OpenAI API supported endpoints:
   - `v1/completions`
@@ -33,17 +32,24 @@ Built in Go for performance and simplicity, llama-swap has zero dependencies and
   - `v1/rerank`, `v1/reranking`, `/rerank`
   - `/infill` - for code infilling
   - `/completion` - for completion endpoint
+  - `/models` - list available models. same behavior as `v1/models`
   - `/props` - requires `?model={model_id}` query parameter to be provided. The autoload parameter is not supported and will be ignored.
 - ✅ SDAPI via [stable-diffusion.cpp's server](https://github.com/leejet/stable-diffusion.cpp/tree/master/examples/server)
   - `/sdapi/v1/txt2img`
   - `/sdapi/v1/img2img`
   - `/sdapi/v1/loras` - requires `model` in request body to fetch the correct loras
+- ✅ [audio.cpp](https://github.com/0xShug0/audio.cpp) supported [extra endpoints](https://github.com/0xShug0/audio.cpp/blob/main/app/server/README.md#post-v1tasksrun)
+  - `/audioapi/v1/tasks/run`
+- ✅ `/audiocpp/` - audio.cpp UI endpoint, served by the `audiocpp_auto` model ([#1221](https://github.com/mostlygeek/llama-swap/issues/1221))
+- ✅ `/comfyui/` - ComfyUI custom endpoint ([#1001](https://github.com/mostlygeek/llama-swap/issues/1001)) for more reliable swapping
 - ✅ llama-swap API
   - `/ui` - web UI
-  - `/upstream/:model_id` - direct access to upstream server ([demo](https://github.com/mostlygeek/llama-swap/pull/31))
+  - `/upstream/:model_id` - direct access to upstream server ([demo](https://github.com/mostlygeek/llama-swap/pull/31))  
   - `/running` - list currently running models ([#61](https://github.com/mostlygeek/llama-swap/issues/61))
   - `POST /api/models/unload` - manually unload all running models ([#58](https://github.com/mostlygeek/llama-swap/issues/58))
   - `POST /api/models/unload/:model_id` - unload a specific model
+  - `GET /api/profiles` - list configured profiles and the active selection
+  - `PUT /api/profiles/active` - activate a profile or select none
   - `/logs` - remote log monitoring
     - `GET /logs` returns buffered plain text logs.
       - If `Accept: text/html` is sent, `/logs` redirects to `/ui/`.
@@ -51,11 +57,13 @@ Built in Go for performance and simplicity, llama-swap has zero dependencies and
       - Stream endpoints send buffered history first by default; add `?no-history` to stream only new lines.
     - `GET /logs/stream/proxy` streams proxy logs only.
     - `GET /logs/stream/upstream` streams upstream process logs only.
+    - `GET /logs/stream/http` streams the HTTP access log only.
     - `GET /logs/stream/{model_id}` streams logs for one model (including IDs with slashes, like `author/model`).
   - `/health` - just returns "OK"
   - `/metrics` - system and GPU metrics for prometheus
 - ✅ API Key support - define keys to restrict access to API endpoints
-- ✅ Customizable
+- ✅ Customization
+  - Switch model ID routing at runtime with profiles
   - Run concurrent models with a custom DSL swap matrix ([#643](https://github.com/mostlygeek/llama-swap/issues/643))
   - Automatic unloading of models after timeout by setting a `ttl`
   - Docker and Podman support using `cmd` and `cmdStop` together
@@ -99,22 +107,114 @@ llama-swap can be installed in multiple ways
 
 Two types of container images are built nightly for llama-swap:
 
-1. A unified container with llama-server, ik-llama-server, stable-diffusion.cpp, whisper.cpp and llama-swap built from source. This is only available for cuda and vulkan but has more capabilities. This one is recommended for use.
-2. A legacy image that is based on llama.cpp's images and llama-swap copied into the container. Use this one if you prefer to stay close to llama.cpp's container images.
+1. A unified container with llama-server, ik-llama-server, stable-diffusion.cpp, whisper.cpp, audio.cpp and llama-swap all built from source. Available for CUDA 12, CUDA 13 and Vulkan. This one is recommended for use.
+2. A legacy image, which is llama.cpp's own `llama-server` container with llama-swap copied in. It carries only what that base image ships, so no image generation, speech or ik-llama-server.
 
 #### Unified container (Recommended)
 
+There are three unified images. Pick the one that matches your GPU:
+
+| tag | platforms | GPUs |
+| --- | --- | --- |
+| `unified-cuda13` | amd64, arm64 | NVIDIA Ampere through Blackwell: A100, RTX 30xx/40xx/50xx, H100, RTX PRO, and GB10 on DGX Spark. Built with CUDA 13. |
+| `unified-cuda` | amd64 | NVIDIA Pascal through Ada: P40, P100, GTX 10xx, RTX 20xx/30xx/40xx. Built with CUDA 12, for cards CUDA 13 dropped. |
+| `unified-vulkan` | amd64 | AMD and other Vulkan capable GPUs. |
+
+`unified-cuda13` is a multi-arch tag, so `docker pull` picks the right image for
+the host — including the aarch64 one a DGX Spark needs.
+
 ```shell
-$ docker pull ghcr.io/mostlygeek/llama-swap:unified-cuda
+$ docker pull ghcr.io/mostlygeek/llama-swap:unified-cuda13
 
 # run with a custom configuration and models directory
 $ docker run -it --rm --runtime nvidia -p 9292:8080 \
  -v /path/to/models:/models \
  -v /path/to/custom/config.yaml:/etc/llama-swap/config/config.yaml \
- ghcr.io/mostlygeek/llama-swap:unified-cuda
+ ghcr.io/mostlygeek/llama-swap:unified-cuda13
 ```
 
+##### Configuring startup with environment variables
+
+The unified images can be configured with `LLAMA_SWAP_*` environment variables
+instead of command line flags, which is usually easier in a compose file or a
+Kubernetes manifest. Each one maps to a llama-swap flag:
+
+| variable | flag | default in the image |
+| --- | --- | --- |
+| `LLAMA_SWAP_CONFIG` | `-config` | `/etc/llama-swap/config/config.yaml` |
+| `LLAMA_SWAP_CONFIG_DIR` | `-config-dir` | — |
+| `LLAMA_SWAP_LISTEN` | `-listen` | `0.0.0.0:8080` |
+| `LLAMA_SWAP_TLS_CERT_FILE` | `-tls-cert-file` | — |
+| `LLAMA_SWAP_TLS_KEY_FILE` | `-tls-key-file` | — |
+| `LLAMA_SWAP_LISTEN_TAILCAT` | `-listen-tailcat` | — |
+| `LLAMA_SWAP_WATCH_CONFIG` | `-watch-config` | `true` |
+
+```shell
+# configure startup with environment variables instead of flags
+$ docker run -it --rm --runtime nvidia -p 9292:8080 \
+ -v /path/to/models:/models \
+ -e LLAMA_SWAP_CONFIG=/models/llama-swap.yaml \
+ -e LLAMA_SWAP_LISTEN=0.0.0.0:8080 \
+ -e LLAMA_SWAP_WATCH_CONFIG=false \
+ ghcr.io/mostlygeek/llama-swap:unified-cuda13
+```
+
+```yaml
+services:
+  llama-swap:
+    image: ghcr.io/mostlygeek/llama-swap:unified-cuda13
+    ports:
+      - "9292:8080"
+    volumes:
+      - /path/to/models:/models
+    environment:
+      LLAMA_SWAP_CONFIG: /models/llama-swap.yaml
+      LLAMA_SWAP_LISTEN: 0.0.0.0:8080
+      LLAMA_SWAP_WATCH_CONFIG: "false"
+```
+
+**Keep `LLAMA_SWAP_LISTEN` on `0.0.0.0` whenever you publish a port.** A
+container that binds its own loopback is not reachable through `-p`, so
+`localhost:8080` there gives connection refused. Bind loopback only when the
+container shares the host's network, where it usefully limits llama-swap to the
+host itself:
+
+```shell
+# reachable from the host only, not from the network
+$ docker run -it --rm --runtime nvidia --network host \
+ -v /path/to/models:/models \
+ -e LLAMA_SWAP_LISTEN=localhost:8080 \
+ ghcr.io/mostlygeek/llama-swap:unified-cuda13
+```
+
+An unset or empty variable contributes nothing and leaves llama-swap's own
+default. Booleans accept `true`/`false`, `1`/`0`, `yes`/`no` or `on`/`off` in any
+case; anything else stops the container rather than being read as "off".
+`-version` is deliberately not mapped — use `docker run <image> -version`.
+
+Passing flags to the container still works and behaves exactly as it always has:
+arguments replace every default rather than adding to the variables above.
+
+```shell
+# unchanged: runs `llama-swap -config /models/my.yaml`, nothing else added
+$ docker run ghcr.io/mostlygeek/llama-swap:unified-cuda13 -config /models/my.yaml
+```
+
+See [docker/unified/README.md](docker/unified/README.md#configuring-with-environment-variables)
+for the details.
+
 #### Legacy container
+
+This image is llama.cpp's own `llama-server` container
+([ghcr.io/ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp/pkgs/container/llama.cpp))
+with the llama-swap binary copied into it. It tracks llama.cpp's nightly server
+images closely, which is its only real advantage.
+
+**Prefer the unified container.** The legacy image inherits whatever the
+`llama-server` base ships and nothing else, so it has no stable-diffusion.cpp,
+whisper.cpp, audio.cpp or ik-llama-server, and no `LLAMA_SWAP_*` environment
+variable support. Use it only if staying on llama.cpp's exact server image
+matters to you.
 
 ```shell
 $ docker pull ghcr.io/mostlygeek/llama-swap:cuda
@@ -216,6 +316,7 @@ Almost all configuration settings are optional and can be added one step at a ti
   - `macros` reusable snippets
 - Model customization
   - `ttl` to automatically unload models
+  - `unloadTimeout` to tune graceful unloads (manual, API and `ttl` expiry)
   - `aliases` to use familiar model names (e.g., "gpt-4o-mini")
   - `env` to pass custom environment variables to inference servers
   - `cmdStop` gracefully stop Docker/Podman containers
@@ -223,7 +324,21 @@ Almost all configuration settings are optional and can be added one step at a ti
   - `${PORT}` automatic port variables for dynamic port assignment
   - `filters` rewrite parts of requests before sending to the upstream server
 
-See the [configuration documentation](docs/configuration.md) for all options.
+See the [configuration overview](docs/kb/guides/configuration/configuration-overview.md)
+to get started, and the [knowledge base](docs/kb/) for focused guides on the features
+people ask about most.
+
+You can also just ask. The **Help** page (in the sidebar) is an agent that calls
+llama-swap's own documentation tools and answers questions about your
+configuration using the real text of `config.example.yaml` and the knowledge
+base, running entirely on a local model. Pick a tool-capable model on the
+**Help** page and ask away — see
+[Writing the cmd for a model](docs/kb/guides/model-runtime/writing-cmd.md) if the model
+answers without calling anything (older llama-server builds need `--jinja` added explicitly).
+
+Those same tools are served as an MCP endpoint at `/api/mcp`, so any MCP client
+can ask about your configuration too. See
+[Connecting an MCP client](docs/kb/guides/api-integration/mcp-endpoint.md).
 
 ## How does llama-swap work?
 
@@ -238,7 +353,7 @@ If you deploy llama-swap behind nginx, disable response buffering for streaming 
 Recommended nginx configuration snippets:
 
 ```nginx
-# SSE for UI events/logs
+# SSE for UI events and logs (also covers /api/events/logs)
 location /api/events {
     proxy_pass http://your-llama-swap-backend;
     proxy_buffering off;
@@ -270,6 +385,9 @@ curl -Ns http://host/logs/stream/proxy
 # stream logs from upstream processes that llama-swap loads
 curl -Ns http://host/logs/stream/upstream
 
+# stream the HTTP access log, one line per request
+curl -Ns http://host/logs/stream/http
+
 # stream logs only from a specific model
 curl -Ns http://host/logs/stream/{model_id}
 
@@ -285,10 +403,3 @@ curl -Ns 'http://host/logs/stream?no-history'
 Any OpenAI compatible server would work. llama-swap was originally designed for llama-server and it is the best supported.
 
 For Python based inference servers like vllm or tabbyAPI it is recommended to run them via podman or docker. This provides clean environment isolation as well as responding correctly to `SIGTERM` signals for proper shutdown.
-
-## Star History
-
-> [!NOTE]
-> Thank you to everyone who has given this project a ⭐️!
-
-[![Star History Chart](https://api.star-history.com/svg?repos=mostlygeek/llama-swap&type=Date)](https://www.star-history.com/#mostlygeek/llama-swap&Date)

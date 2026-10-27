@@ -4,17 +4,46 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 const DEFAULT_GROUP_ID = "(default)"
+const DEFAULT_UNLOAD_TIMEOUT = 10
+const DEFAULT_MAX_REQUEST_BODY_MB = 250
 const (
 	LogToStdoutProxy    = "proxy"
 	LogToStdoutUpstream = "upstream"
+	LogToStdoutHTTP     = "http"
 	LogToStdoutBoth     = "both"
 	LogToStdoutNone     = "none"
 )
+
+// ParseLogToStdout reports which log streams logToStdout sends to stdout. It
+// accepts "none", "both" (every stream), or a comma separated list of
+// "proxy", "upstream" and "http".
+func ParseLogToStdout(value string) (proxy, upstream, http bool, err error) {
+	switch strings.TrimSpace(value) {
+	case LogToStdoutNone:
+		return false, false, false, nil
+	case LogToStdoutBoth:
+		return true, true, true, nil
+	}
+	for item := range strings.SplitSeq(value, ",") {
+		switch strings.TrimSpace(item) {
+		case LogToStdoutProxy:
+			proxy = true
+		case LogToStdoutUpstream:
+			upstream = true
+		case LogToStdoutHTTP:
+			http = true
+		default:
+			return false, false, false, fmt.Errorf("logToStdout must be none, both, or a comma separated list of proxy, upstream, http; got %q", value)
+		}
+	}
+	return proxy, upstream, http, nil
+}
 
 type MacroEntry struct {
 	Name  string
@@ -52,6 +81,25 @@ func (ml *MacroList) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+// MarshalYAML renders the list back as an ordered mapping, the shape it is
+// written in, rather than the default slice-of-structs. Only diagnostics such
+// as the config__get_config tool marshal a Config, but when they do the macro
+// block should read like the source file.
+func (ml MacroList) MarshalYAML() (interface{}, error) {
+	node := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	for _, entry := range ml {
+		var key, value yaml.Node
+		if err := key.Encode(entry.Name); err != nil {
+			return nil, fmt.Errorf("encoding macro name %q: %w", entry.Name, err)
+		}
+		if err := value.Encode(entry.Value); err != nil {
+			return nil, fmt.Errorf("encoding macro value for %q: %w", entry.Name, err)
+		}
+		node.Content = append(node.Content, &key, &value)
+	}
+	return node, nil
+}
+
 // Get retrieves a macro value by name
 func (ml MacroList) Get(name string) (any, bool) {
 	for _, entry := range ml {
@@ -60,15 +108,6 @@ func (ml MacroList) Get(name string) (any, bool) {
 		}
 	}
 	return nil, false
-}
-
-// ToMap converts MacroList to a map (for backward compatibility if needed)
-func (ml MacroList) ToMap() map[string]any {
-	result := make(map[string]any, len(ml))
-	for _, entry := range ml {
-		result[entry.Name] = entry.Value
-	}
-	return result
 }
 
 type GroupConfig struct {
@@ -102,30 +141,77 @@ type HooksConfig struct {
 
 type HookOnStartup struct {
 	Preload []string `yaml:"preload"`
+	Profile string   `yaml:"profile"`
+}
+
+type Store struct {
+	Path string `yaml:"path"`
+}
+
+type UIConfig struct {
+	Activity UIActivityConfig `yaml:"activity" json:"activity"`
+}
+
+type UIActivityConfig struct {
+	SessionID []string `yaml:"session_id" json:"session_id"`
+}
+
+// HelpAgentConfig controls the UI's Help page and the /api/mcp endpoint that
+// serves its tools.
+type HelpAgentConfig struct {
+	Disable bool `yaml:"disable" json:"disable"`
+}
+
+// ProfileConfig describes a runtime-selectable set of model ID rewrites.
+// Empty pin targets disable the corresponding model ID while the profile is
+// active. YAML null values decode to the same empty string representation.
+type ProfileConfig struct {
+	Description string            `yaml:"description" json:"description"`
+	Pins        map[string]string `yaml:"pins" json:"pins"`
+}
+
+// UnmarshalYAML rejects the removed list-shaped profile syntax with a useful
+// migration error while allowing null pin values to normalize to empty strings.
+func (c *ProfileConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("profile must be a mapping with description and pins; the legacy list syntax is no longer supported")
+	}
+	type rawProfileConfig ProfileConfig
+	var raw rawProfileConfig
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*c = ProfileConfig(raw)
+	return nil
 }
 
 type Config struct {
-	HealthCheckTimeout int    `yaml:"healthCheckTimeout"`
-	LogRequests        bool   `yaml:"logRequests"`
-	LogLevel           string `yaml:"logLevel"`
-	LogTimeFormat      string `yaml:"logTimeFormat"`
-	LogToStdout        string `yaml:"logToStdout"`
-	MetricsMaxInMemory int    `yaml:"metricsMaxInMemory"`
-	CaptureBuffer      int    `yaml:"captureBuffer"`
+	Tailcat            *TailcatConfig    `yaml:"tailcat"`
+	HealthCheckTimeout int               `yaml:"healthCheckTimeout"`
+	LogRequests        bool              `yaml:"logRequests"`
+	LogLevel           string            `yaml:"logLevel"`
+	LogTimeFormat      string            `yaml:"logTimeFormat"`
+	LogToStdout        string            `yaml:"logToStdout"`
+	MetricsMaxInMemory int               `yaml:"metricsMaxInMemory"`
+	CaptureBuffer      int               `yaml:"captureBuffer"`
+	Store              *Store            `yaml:"store"`
+	UI                 UIConfig          `yaml:"ui"`
+	Performance        PerformanceConfig `yaml:"performance"`
+	HelpAgent          HelpAgentConfig   `yaml:"helpagent"`
+	GlobalTTL          int               `yaml:"globalTTL"`
+	UnloadTimeout      int               `yaml:"unloadTimeout"`
 
-	// MetricsDbPath is the SQLite file persisting the activity log. Empty
-	// resolves to llama-swap.metrics.db next to the config file; ":memory:"
-	// disables persistence (bounded by MetricsMaxInMemory).
-	MetricsDbPath string `yaml:"metricsDbPath"`
+	Models    map[string]ModelConfig    `yaml:"models"` /* key is model ID */
+	Profiles  map[string]ProfileConfig  `yaml:"profiles"`
+	Selectors map[string]SelectorConfig `yaml:"selectors"`
 
-	// MetricsRetentionDays bounds the age of persisted metrics; 0 keeps them
-	// forever.
-	MetricsRetentionDays int `yaml:"metricsRetentionDays"`
+	// GlobalConcurrencyLimit caps the number of inference requests served at
+	// once across all models. 0 (default) means no limit. See issue #1086.
+	GlobalConcurrencyLimit int `yaml:"globalConcurrencyLimit"`
 
-	Performance PerformanceConfig      `yaml:"performance"`
-	GlobalTTL   int                    `yaml:"globalTTL"`
-	Models      map[string]ModelConfig `yaml:"models"` /* key is model ID */
-	Profiles    map[string][]string    `yaml:"profiles"`
+	// MaxRequestBodyMB caps the size, in megabytes, of request bodies on
+	// model-dispatched POSTs. Larger requests get HTTP 413.
+	MaxRequestBodyMB int `yaml:"maxRequestBodyMB"`
 
 	// routing is the canonical source for swap/scheduling configuration.
 	// New code must read Routing, never the backwards-compat fields below.
@@ -163,6 +249,35 @@ type Config struct {
 
 	// upstream controls behaviour of the /upstream passthrough endpoint
 	Upstream UpstreamConfig `yaml:"upstream"`
+
+	// security groups CORS and related hardening settings, see issue #1133
+	Security SecurityConfig `yaml:"security"`
+
+	// tailcatEnabled records whether this process started a Tailcat listener.
+	// It is runtime state, not user configuration, so it must never appear in
+	// rendered configuration output.
+	tailcatEnabled bool
+}
+
+// SetTailcatEnabled records whether this process has a Tailcat listener.
+// main owns this startup-only setting from -listen-tailcat.
+func (c *Config) SetTailcatEnabled(enabled bool) {
+	c.tailcatEnabled = enabled
+}
+
+// TailcatEnabled reports whether this process has a Tailcat listener.
+func (c Config) TailcatEnabled() bool {
+	return c.tailcatEnabled
+}
+
+// MaxRequestBodyBytes returns MaxRequestBodyMB in bytes. Configs not built by
+// LoadConfigFromReader leave MaxRequestBodyMB at 0 and get the default.
+func (c Config) MaxRequestBodyBytes() int64 {
+	mb := c.MaxRequestBodyMB
+	if mb <= 0 {
+		mb = DEFAULT_MAX_REQUEST_BODY_MB
+	}
+	return int64(mb) << 20
 }
 
 // RoutingConfig is the canonical, normalized routing/scheduling configuration.
@@ -185,13 +300,14 @@ type FifoConfig struct {
 }
 
 type RouterConfig struct {
-	Use      string         `yaml:"use"` // "group" (default) | "matrix"
+	Use      string         `yaml:"use"` // "group" (default) | "matrix" | "capacity"
 	Settings RouterSettings `yaml:"settings"`
 }
 
 type RouterSettings struct {
-	Groups map[string]GroupConfig `yaml:"groups"`
-	Matrix *MatrixConfig          `yaml:"matrix"`
+	Groups   map[string]GroupConfig `yaml:"groups"`
+	Matrix   *MatrixConfig          `yaml:"matrix"`
+	Capacity *CapacityConfig        `yaml:"capacity"`
 }
 
 func (c *Config) RealModelName(search string) (string, bool) {
@@ -210,6 +326,18 @@ func (c *Config) FindConfig(modelName string) (ModelConfig, string, bool) {
 	} else {
 		return c.Models[realName], realName, true
 	}
+}
+
+// ResolveBaseModel resolves a name without applying profiles. Local model IDs
+// and aliases take precedence over peer model IDs, matching server dispatch.
+func (c *Config) ResolveBaseModel(search string) (string, bool) {
+	if realName, found := c.RealModelName(search); found {
+		return realName, true
+	}
+	if _, _, found := c.ResolvePeerModel(search); found {
+		return search, true
+	}
+	return "", false
 }
 
 func LoadConfig(path string) (Config, error) {

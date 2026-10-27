@@ -18,12 +18,12 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // ErrModelNotFound is granted to callers whose model is not handled by this
-// router. It is an alias for shared.ErrNoLocalModelFound.
-var ErrModelNotFound = shared.ErrNoLocalModelFound
+// router. It is an alias for swaputil.ErrNoLocalModelFound.
+var ErrModelNotFound = swaputil.ErrNoLocalModelFound
 
 // Swapper is the eviction policy: it decides which running models must be
 // stopped before a target can serve. It is orthogonal to the scheduling
@@ -80,7 +80,9 @@ type Effects interface {
 	// set it hands the Swapper.
 	RunningModels() map[string]process.ProcessState
 	// StartSwap launches the swap goroutine for modelID, stopping evict first.
-	StartSwap(modelID string, evict []string)
+	// Its result identifies this generation. The returned function cancels the
+	// swap and blocks until it exits, without needing OnSwapDone to run.
+	StartSwap(modelID string, generation uint64, evict []string) func()
 	// GrantError responds to a caller with an error.
 	GrantError(req HandlerReq, err error)
 	// GrantServe hands a caller the wrapped handler for modelID and reports
@@ -126,8 +128,9 @@ type HandlerResp struct {
 
 // SwapDone is reported by a swap goroutine when its target is ready (or failed).
 type SwapDone struct {
-	ModelID string
-	Err     error
+	ModelID    string
+	Generation uint64
+	Err        error
 }
 
 // ServeDoneEvent is reported when a tracked ServeHTTP handler returns.
