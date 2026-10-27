@@ -10,7 +10,7 @@
     selectorModels,
     unloadAllModels,
   } from "../stores/api";
-  import { loadingMessage, loadingPercent, statusDotColor } from "../stores/modelLoad";
+  import { canStop, loadingMessage, loadingPercent, statusDotColor } from "../stores/modelLoad";
   import { showUnlistedModels as showUnlisted, showCapabilityTags } from "../stores/modelDisplay";
   import { listCapabilityBadges, capabilityBadgeClass } from "../lib/capabilities";
   import type { Model } from "../lib/types";
@@ -45,7 +45,7 @@
   );
 
   let readyCount = $derived($models.filter((m) => m.state === "ready").length);
-  let anyReady = $derived(readyCount > 0);
+  let anyStoppable = $derived($models.some(canStop));
 
   async function handleUnloadAll(): Promise<void> {
     unloadingAll = true;
@@ -181,7 +181,7 @@
             variant="outline"
             size="sm"
             onclick={handleUnloadAll}
-            disabled={!anyReady || unloadingAll}
+            disabled={!anyStoppable || unloadingAll}
           >
             {#if unloadingAll}
               <Loader2 class="size-3.5 animate-spin" />

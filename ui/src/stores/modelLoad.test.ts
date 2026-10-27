@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { loadingMessage, loadingPercent } from "./modelLoad";
-import type { Model } from "../lib/types";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { loadingMessage, loadingPercent, onToggleLoad } from "./modelLoad";
+import type { Model, ModelStatus } from "../lib/types";
 
 function model(fields: Partial<Model>): Model {
   return { id: "m", state: "stopped", name: "", description: "", unlisted: false, peerID: "", ...fields };
@@ -26,5 +26,32 @@ describe("loadingMessage", () => {
     expect(loadingMessage(model({ state: "starting", loadingMessage: "loading tensors" }))).toBe("loading tensors");
     expect(loadingMessage(model({ state: "ready", loadingMessage: "loading tensors" }))).toBe("");
     expect(loadingMessage(model({ state: "starting" }))).toBe("");
+  });
+});
+
+describe("onToggleLoad", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each(["ready", "starting", "sleeping", "waking", "going-to-sleep"] as ModelStatus[])(
+    "unloads a %s model",
+    (state) => {
+      const fetchMock = vi.fn().mockResolvedValue(new Response("OK"));
+      vi.stubGlobal("fetch", fetchMock);
+
+      onToggleLoad(model({ state }));
+
+      expect(fetchMock).toHaveBeenCalledWith("/api/models/unload/m", { method: "POST" });
+    }
+  );
+
+  it("does nothing while a model is stopping", () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    onToggleLoad(model({ state: "stopping" }));
+
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

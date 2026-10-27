@@ -1,6 +1,6 @@
 import { writable } from "svelte/store";
 import { loadModel, unloadSingleModel } from "./api";
-import type { Model } from "../lib/types";
+import type { Model, ModelStatus } from "../lib/types";
 
 export const pendingLoads = writable<Record<string, boolean>>({});
 const loadControllers = new Map<string, AbortController>();
@@ -35,12 +35,25 @@ export function isPending(id: string): boolean {
   return val;
 }
 
+// States an unload request can stop, including a load or sleep/wake still in progress.
+const stoppableStates: ReadonlySet<ModelStatus> = new Set<ModelStatus>([
+  "ready",
+  "starting",
+  "sleeping",
+  "waking",
+  "going-to-sleep",
+]);
+
+export function canStop(m: Model): boolean {
+  return stoppableStates.has(m.state);
+}
+
 export function onToggleLoad(m: Model): void {
   if (m.state === "stopped" && isPending(m.id)) {
     cancelLoad(m.id);
   } else if (m.state === "stopped") {
     void handleLoadModel(m.id);
-  } else if (m.state === "ready") {
+  } else if (canStop(m)) {
     void unloadSingleModel(m.id);
   }
 }
