@@ -62,8 +62,8 @@ test-chart:
 		fi; \
 	done
 
-ui/node_modules:
-	cd ui && npm install
+ui/node_modules: ui/package.json ui/package-lock.json
+	cd ui && npm install && touch node_modules
 
 # build the UI into internal/server/ui_dist; the `embed_ui` build tag embeds
 # this output into the binary (see internal/server/embed.go)
