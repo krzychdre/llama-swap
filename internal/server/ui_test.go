@@ -46,6 +46,16 @@ func serveUIRequest(t *testing.T, path, acceptEncoding string) *httptest.Respons
 	return w
 }
 
+func TestServer_HandleUI_SetsContentSecurityPolicy(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ui/", nil))
+
+	if got := w.Header().Get("Content-Security-Policy"); got != uiContentSecurityPolicy {
+		t.Errorf("Content-Security-Policy = %q, want %q", got, uiContentSecurityPolicy)
+	}
+}
+
 func TestServer_ServeUI_File(t *testing.T) {
 	w := serveUIRequest(t, "/ui/app.js", "")
 	if w.Code != http.StatusOK {

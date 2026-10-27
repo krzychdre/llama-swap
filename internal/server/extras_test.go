@@ -112,6 +112,37 @@ func TestServer_BodyCopier_Hijack(t *testing.T) {
 	})
 }
 
+func TestServer_BodyCopier_CapsBufferedCopy(t *testing.T) {
+	rec := httptest.NewRecorder()
+	bc := newBodyCopier(rec)
+	chunk := bytes.Repeat([]byte("a"), 1<<20)
+	for written := 0; written <= maxBufferedBodyBytes; written += len(chunk) {
+		bc.Write(chunk)
+	}
+
+	if got := bc.body.Len(); got != maxBufferedBodyBytes {
+		t.Errorf("buffered bytes = %d, want %d", got, maxBufferedBodyBytes)
+	}
+	if got, want := rec.Body.Len(), len(chunk)*(maxBufferedBodyBytes/len(chunk)+1); got != want {
+		t.Errorf("client bytes = %d, want %d", got, want)
+	}
+}
+
+func TestServer_DecompressBody_CapsOutput(t *testing.T) {
+	var gz bytes.Buffer
+	gw := gzip.NewWriter(&gz)
+	gw.Write(bytes.Repeat([]byte("a"), maxBufferedBodyBytes+1))
+	gw.Close()
+
+	got, err := decompressBody(gz.Bytes(), "gzip")
+	if err != nil {
+		t.Fatalf("decompressBody: %v", err)
+	}
+	if len(got) != maxBufferedBodyBytes {
+		t.Errorf("decoded bytes = %d, want %d", len(got), maxBufferedBodyBytes)
+	}
+}
+
 func TestServer_BodyCopier_SkipsBufferingOnUpgrade(t *testing.T) {
 	rec := httptest.NewRecorder()
 	bc := newBodyCopier(rec)

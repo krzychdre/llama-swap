@@ -23,6 +23,9 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/store/sqlite"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 // stubRouter is a minimal router.LocalRouter for Server dispatch tests.
@@ -410,7 +413,7 @@ func TestServer_Unload(t *testing.T) {
 	s := newTestServer(local, newStubRouter(nil, ""))
 
 	w := httptest.NewRecorder()
-	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/unload", nil))
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/unload", nil))
 
 	if w.Code != http.StatusOK || w.Body.String() != "OK" {
 		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
@@ -424,6 +427,86 @@ func TestServer_Unload(t *testing.T) {
 	if local.unloadTimeout != 0 {
 		t.Errorf("unloadTimeout=%v want 0 (use configured timeouts)", local.unloadTimeout)
 	}
+
+	t.Run("GET is no longer routed", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/unload", nil))
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want 405", w.Code)
+		}
+		if got := local.unloadCalls.Load(); got != 1 {
+			t.Errorf("unloadCalls = %d, want the GET not to unload", got)
+		}
+	})
+
+	t.Run("cross-origin POST is rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/unload", nil)
+		req.Host = "example.com"
+		req.Header.Set("Origin", "http://evil.example")
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", w.Code)
+		}
+		if got := local.unloadCalls.Load(); got != 1 {
+			t.Errorf("unloadCalls = %d, want the forged POST not to unload", got)
+		}
+	})
+}
+
+func TestServer_UpstreamRequestBodyTooLarge(t *testing.T) {
+	cfg := config.Config{MaxRequestBodyMB: 1, Models: map[string]config.ModelConfig{"m1": {}}}
+	local := newStubRouter([]string{"m1"}, "ok")
+	s := newTestServerWithConfig(cfg, local, newStubRouter(nil, ""))
+
+	t.Run("declared Content-Length over the cap", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/upstream/m1/v1/chat/completions", strings.NewReader(`{"model":"m1"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.ContentLength = 1<<20 + 1
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, req)
+		require.Equal(t, http.StatusRequestEntityTooLarge, w.Code, w.Body.String())
+	})
+
+	t.Run("chunked body over the cap", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/upstream/m1/v1/chat/completions", io.LimitReader(zeroReader{}, 1<<20+1))
+		req.ContentLength = -1
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, req)
+		require.Equal(t, http.StatusRequestEntityTooLarge, w.Code, w.Body.String())
+	})
+}
+
+func TestServer_UpstreamAppliesFilters(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  m1:
+    cmd: echo ${PORT}
+    filters:
+      stripParams: temperature
+      setParams:
+        top_p: 0.9
+`))
+	require.NoError(t, err)
+
+	var gotBody string
+	local := newStubRouter([]string{"m1"}, "")
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.WriteHeader(http.StatusOK)
+	}
+	s := newTestServerWithConfig(cfg, local, newStubRouter(nil, ""))
+
+	req := httptest.NewRequest(http.MethodPost, "/upstream/m1/v1/chat/completions", strings.NewReader(`{"model":"m1","temperature":0.7}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.False(t, gjson.Get(gotBody, "temperature").Exists(), "temperature should be stripped: %s", gotBody)
+	assert.Equal(t, 0.9, gjson.Get(gotBody, "top_p").Float())
 }
 
 func TestServer_Running(t *testing.T) {

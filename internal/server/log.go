@@ -183,8 +183,12 @@ func (sr *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 // forwardedIP reads the client address from the X-Forwarded-For or
 // X-Real-IP headers, preferring X-Forwarded-For's first (left-most) entry.
-// ok is false when neither header is set.
+// ok is false when neither header is set, and when the connection's peer is
+// not a loopback address, since then the client wrote the header itself.
 func forwardedIP(r *http.Request) (ip string, ok bool) {
+	if !isLoopbackPeer(r.RemoteAddr) {
+		return "", false
+	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		first, _, _ := strings.Cut(xff, ",")
 		if trimmed := strings.TrimSpace(first); trimmed != "" {
@@ -197,6 +201,18 @@ func forwardedIP(r *http.Request) (ip string, ok bool) {
 		}
 	}
 	return "", false
+}
+
+// isLoopbackPeer reports whether addr, a request's RemoteAddr, is a loopback
+// address. Only a local reverse proxy can be trusted to set the forwarding
+// headers.
+func isLoopbackPeer(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // clientIP resolves the originating client address, preferring proxy headers

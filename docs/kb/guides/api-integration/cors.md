@@ -4,7 +4,7 @@ summary: How llama-swap decides which Access-Control headers to send, and how to
 category: guides
 tags: [cors, browser, origin, dashboard, litellm, preflight]
 config_keys: [security.cors.allowedOrigins, security.cors.allowCredentials, security.cors.allowedMethods, security.cors.allowedHeaders, security.cors.exposedHeaders, security.cors.maxAge]
-updated: 2026-09-21
+updated: 2026-10-27
 ---
 
 # CORS and browser access
@@ -63,6 +63,13 @@ Two rules apply in both modes:
 2. **llama-swap is the only source of these headers.** Any CORS headers set by
    an upstream — `llama-server` and vLLM both set their own — are stripped from
    proxied responses.
+
+A browser `Origin` that does not match the host llama-swap was reached at is
+also refused with HTTP 403 on state-changing requests: `POST`, `PUT`, `PATCH`
+and `DELETE` to `/api/...` and `POST /unload`. Allowing an origin for CORS says
+who may read responses; it does not let another site unload models or switch
+profiles. Requests without an `Origin` header are unaffected, so curl, SDKs and
+MCP clients keep working.
 
 ## Restricting to one origin
 

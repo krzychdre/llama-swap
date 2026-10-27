@@ -377,6 +377,9 @@ func (s *Server) routes() {
 	modelChain := chain.New(modelMWs...)
 	// Custom endpoints only need auth.
 	apiChain := chain.New(authMW)
+	// State-changing routes also reject a foreign Origin and cap the request
+	// body; the UI's JSON payloads are tiny.
+	apiStateChain := apiChain.Append(sameOriginMiddleware, createRequestBodyLimitMiddleware(maxAPIBodyBytes))
 
 	mux := http.NewServeMux()
 	dispatch := http.HandlerFunc(s.localPeerHandler)
@@ -428,14 +431,17 @@ func (s *Server) routes() {
 	mux.Handle("GET /metrics", apiChain.ThenFunc(s.handleMetrics))
 
 	// Operations endpoints.
-	mux.Handle("GET /unload", apiChain.ThenFunc(s.handleUnload))
+	mux.Handle("POST /unload", apiStateChain.ThenFunc(s.handleUnload))
 	mux.Handle("GET /running", apiChain.ThenFunc(s.handleRunning))
 
 	// Upstream passthrough. Meter only the model-dispatched endpoints that can
 	// produce token usage/timings.
 	upstreamChain := apiChain.Append(
+		createRequestBodyLimitMiddleware(s.cfg.MaxRequestBodyBytes()),
 		CreateProfileMiddleware(s),
 		CreateUpstreamInflightMiddleware(s.inflight, s.cfg),
+		CreateFilterMiddleware(s.cfg),
+		CreateFormFilterMiddleware(s.cfg),
 		CreateMetricsMiddleware(s.metrics, s.cfg),
 	)
 	mux.HandleFunc("GET /upstream", handleUpstreamRedirect)
@@ -453,13 +459,13 @@ func (s *Server) routes() {
 	mux.Handle("/audiocpp/{audioCppPath...}", apiChain.ThenFunc(s.handleAudioCpp))
 
 	// API group (API-key protected) consumed by the UI.
-	mux.Handle("POST /api/models/unload", apiChain.ThenFunc(s.handleAPIUnloadAll))
-	mux.Handle("POST /api/models/unload/{model...}", apiChain.ThenFunc(s.handleAPIUnloadModel))
+	mux.Handle("POST /api/models/unload", apiStateChain.ThenFunc(s.handleAPIUnloadAll))
+	mux.Handle("POST /api/models/unload/{model...}", apiStateChain.ThenFunc(s.handleAPIUnloadModel))
 	mux.Handle("GET /api/profiles", apiChain.ThenFunc(s.handleAPIProfiles))
-	mux.Handle("PUT /api/profiles/active", apiChain.ThenFunc(s.handleAPIActiveProfile))
-	mux.Handle("POST /api/models/sleep/{model...}", apiChain.ThenFunc(s.handleAPISleepModel))
-	mux.Handle("POST /api/models/wake/{model...}", apiChain.ThenFunc(s.handleAPIWakeModel))
-	mux.Handle("POST /api/inflight/{id}/cancel", apiChain.ThenFunc(s.handleAPICancelInflight))
+	mux.Handle("PUT /api/profiles/active", apiStateChain.ThenFunc(s.handleAPIActiveProfile))
+	mux.Handle("POST /api/models/sleep/{model...}", apiStateChain.ThenFunc(s.handleAPISleepModel))
+	mux.Handle("POST /api/models/wake/{model...}", apiStateChain.ThenFunc(s.handleAPIWakeModel))
+	mux.Handle("POST /api/inflight/{id}/cancel", apiStateChain.ThenFunc(s.handleAPICancelInflight))
 	mux.Handle("GET /api/events", apiChain.ThenFunc(s.handleAPIEvents))
 	mux.Handle("GET /api/events/logs", apiChain.ThenFunc(s.handleAPILogEvents))
 	mux.Handle("GET /api/metrics/activity", apiChain.ThenFunc(s.handleAPIActivity))
@@ -475,7 +481,7 @@ func (s *Server) routes() {
 	// Registered without a method so non-POST reaches the handler and gets a
 	// 405 with Allow, rather than the mux's bare 404.
 	if !s.cfg.HelpAgent.Disable {
-		mux.Handle("/api/mcp", apiChain.ThenFunc(s.handleAPIMCP))
+		mux.Handle("/api/mcp", apiChain.Append(sameOriginMiddleware).ThenFunc(s.handleAPIMCP))
 	}
 
 	s.mux = mux

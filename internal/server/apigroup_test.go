@@ -17,7 +17,23 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/stretchr/testify/require"
 )
+
+func TestServer_APIBodyLimit(t *testing.T) {
+	s := newTestServerWithConfig(profileTestConfig(t), newStubRouter([]string{"real"}, "ok"), newStubRouter(nil, ""))
+
+	// A syntactically valid body over the cap: the decoder must reach the
+	// limit rather than fail on the first token.
+	oversized := `{"name":"` + strings.Repeat("a", maxAPIBodyBytes) + `"}`
+	req := httptest.NewRequest(http.MethodPut, "/api/profiles/active", strings.NewReader(oversized))
+	req.ContentLength = -1
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code, w.Body.String())
+}
 
 func TestServer_InflightMiddleware_AddsAndRemovesEntriesAroundRequestHandling(t *testing.T) {
 	tracker := newInflightTracker()
@@ -29,6 +45,7 @@ func TestServer_InflightMiddleware_AddsAndRemovesEntriesAroundRequestHandling(t 
 	}))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.RemoteAddr = "127.0.0.1:50000"
 	started := time.Now().Add(-time.Second)
 	req = req.WithContext(context.WithValue(req.Context(), inflightStartContextKey{}, started))
 	req.Header.Set("User-Agent", "test-agent")
