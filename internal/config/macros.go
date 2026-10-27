@@ -285,19 +285,32 @@ func resolveMacros(macros MacroList) (map[string]resolvedMacro, error) {
 	resolved := make(map[string]resolvedMacro, len(macros))
 	total := 0
 	for _, entry := range macros {
-		text, ok := entry.Value.(string)
-		if !ok {
-			resolved[entry.Name] = resolvedMacro{value: entry.Value, text: fmt.Sprintf("%v", entry.Value)}
-			continue
-		}
-		text = expandMacroText(text, resolved)
-		total += len(text)
+		macro := resolveMacro(entry.Value, resolved)
+		total += len(macro.text)
 		if total > macroExpansionLimit {
 			return nil, fmt.Errorf("macro expansion exceeded %d bytes", macroExpansionLimit)
 		}
-		resolved[entry.Name] = resolvedMacro{value: text, text: text}
+		resolved[entry.Name] = macro
 	}
 	return resolved, nil
+}
+
+// resolveMacro resolves one declaration against the macros declared before it.
+// A value that is exactly one placeholder into an already resolved macro takes
+// that macro's value, type included, so a chain of such declarations keeps the
+// scalar type of the macro it ends at.
+func resolveMacro(value any, resolved map[string]resolvedMacro) resolvedMacro {
+	text, isString := value.(string)
+	if !isString {
+		return resolvedMacro{value: value, text: fmt.Sprintf("%v", value)}
+	}
+	if name, ok := macroPlaceholder(text); ok {
+		if inner, found := resolved[name]; found {
+			return inner
+		}
+	}
+	expanded := expandMacroText(text, resolved)
+	return resolvedMacro{value: expanded, text: expanded}
 }
 
 // substituteMacros replaces every resolved placeholder in a value structure. A
