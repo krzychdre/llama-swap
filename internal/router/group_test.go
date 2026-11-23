@@ -1,15 +1,18 @@
 package router
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 // newTestGroup builds a Group directly from the supplied processes and config,
@@ -86,6 +89,49 @@ func TestGroup_ServeHTTP_SwapStopsPrevious(t *testing.T) {
 	}
 	if got := b.serveCalls.Load(); got != 1 {
 		t.Errorf("b.serveCalls=%d want 1", got)
+	}
+}
+
+// TestGroup_LockedModelNotEvicted checks that a request which would swap out a
+// locked model gets a 423 straight away, before any loading stream, and that
+// nothing is stopped or started.
+func TestGroup_LockedModelNotEvicted(t *testing.T) {
+	a := newFakeProcess("a")
+	a.markReady()
+	go a.Run(0)
+
+	b := newFakeProcess("b")
+	b.autoReady = true
+
+	sendLoading := true
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		Models:             map[string]config.ModelConfig{"b": {SendLoadingState: &sendLoading}},
+		Routing: groupRouting(map[string]config.GroupConfig{
+			"g": {Swap: true, Exclusive: true, Members: []string{"a", "b"}},
+		}),
+	}
+	g := newTestGroup(t, conf, map[string]process.Process{"a": a, "b": b})
+	g.SetLockCheck(func(modelID string) bool { return modelID == "a" })
+
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, newStreamRequest("b"))
+
+	if w.Code != http.StatusLocked {
+		t.Fatalf("status=%d want 423 body=%q", w.Code, w.Body.String())
+	}
+	var envelope swaputil.ErrorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("body is not an error envelope: %v, body=%q", err, w.Body.String())
+	}
+	if envelope.Error.Code != "model_locked" || !strings.Contains(envelope.Error.Message, "locked model a") {
+		t.Errorf("error=%+v want code model_locked naming locked model a", envelope.Error)
+	}
+	if got := a.stopCalls.Load(); got != 0 {
+		t.Errorf("a.stopCalls=%d want 0", got)
+	}
+	if got := b.runCalls.Load(); got != 0 {
+		t.Errorf("b.runCalls=%d want 0", got)
 	}
 }
 

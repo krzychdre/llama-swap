@@ -76,6 +76,10 @@ type Server struct {
 	// is shared across the Server instances a hot config reload creates.
 	pause *PauseState
 
+	// locks keeps locked models from being evicted by requests for other
+	// models. Shared across reloads like pause.
+	locks *ModelLocks
+
 	local router.LocalRouter
 	peer  router.Router
 
@@ -258,8 +262,9 @@ type BuildInfo struct {
 // leaves the code__* tools out.
 //
 // pause is shared across reloads too, so a reload keeps inference paused; nil
-// starts a fresh, unpaused state.
-func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs, code *sourcecode.Provider, pause *PauseState) (*Server, error) {
+// starts a fresh, unpaused state. locks is shared the same way; nil starts
+// with no model locked.
+func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs, code *sourcecode.Provider, pause *PauseState, locks *ModelLocks) (*Server, error) {
 	var local router.LocalRouter
 	var err error
 
@@ -299,6 +304,10 @@ func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.
 		pause = NewPauseState()
 	}
 	local.SetStartGate(pause.startGate)
+	if locks == nil {
+		locks = NewModelLocks()
+	}
+	local.SetLockCheck(locks.Locked)
 
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	s := &Server{
@@ -313,6 +322,7 @@ func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.
 		reference:     refs,
 		activeProfile: cfg.Hooks.OnStartup.Profile,
 		pause:         pause,
+		locks:         locks,
 		local:         local,
 		peer:          peer,
 		shutdownCtx:   shutdownCtx,
@@ -528,6 +538,8 @@ func (s *Server) routes() {
 	mux.Handle("PUT /api/profiles/active", apiStateChain.ThenFunc(s.handleAPIActiveProfile))
 	mux.Handle("POST /api/models/sleep/{model...}", apiStateChain.ThenFunc(s.handleAPISleepModel))
 	mux.Handle("POST /api/models/wake/{model...}", apiStateChain.ThenFunc(s.handleAPIWakeModel))
+	mux.Handle("POST /api/models/lock/{model...}", apiStateChain.ThenFunc(s.handleAPILockModel))
+	mux.Handle("POST /api/models/unlock/{model...}", apiStateChain.ThenFunc(s.handleAPIUnlockModel))
 	mux.Handle("POST /api/inflight/{id}/cancel", apiStateChain.ThenFunc(s.handleAPICancelInflight))
 	mux.Handle("GET /api/events", apiChain.ThenFunc(s.handleAPIEvents))
 	mux.Handle("GET /api/events/logs", apiChain.ThenFunc(s.handleAPILogEvents))

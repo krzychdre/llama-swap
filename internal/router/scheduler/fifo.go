@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -88,6 +89,8 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 // The decision tree, in order:
 //
 //  1. Unknown model — respond with ErrModelNotFound and move on.
+//     Would evict a locked model: reject before admission, so the caller
+//     gets the error at once instead of a loading stream.
 //  2. A swap to the same model is already in flight — attach this waiter so
 //     one swap serves all callers that asked for the same model.
 //  3. Fast path — the target process is already ready, the planner sees
@@ -108,19 +111,28 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
+	// A swap already in flight was cleared against the locks when it started.
+	sw, joining := s.active[req.Model]
+	var running, evict []string
+	if !joining {
+		running = s.runningSet(req.Model)
+		evict = s.planner.EvictionFor(req.Model, running)
+		if err := s.lockedError(req.Model, evict); err != nil {
+			s.rejectAdmission(req, err)
+			return
+		}
+	}
+
 	if !s.admit(req) {
 		return
 	}
 
 	// (2) Join an in-flight swap for the same model.
-	if sw, ok := s.active[req.Model]; ok {
+	if joining {
 		s.logger.Debugf("%s: joining in-flight swap for model %s (%d waiters)", s.name, req.Model, len(sw.waiters)+1)
 		sw.waiters = append(sw.waiters, req)
 		return
 	}
-
-	running := s.runningSet(req.Model)
-	evict := s.planner.EvictionFor(req.Model, running)
 
 	// (3) Fast path: ready, nothing to evict, and nobody is evicting us.
 	if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
@@ -461,6 +473,10 @@ func (s *FIFO) drainQueue() {
 		}
 		running := s.runningSet(req.Model)
 		evict := s.planner.EvictionFor(req.Model, running)
+		if err := s.lockedError(req.Model, evict); err != nil {
+			s.grantError(req, err)
+			continue
+		}
 		if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
 			s.logger.Debugf("%s: queued request for model %s now served fast-path", s.name, req.Model)
 			s.grantHandler(req, req.Model)
@@ -479,6 +495,22 @@ func (s *FIFO) drainQueue() {
 	}
 	s.queued = remaining
 	broadcastQueuePositions(s.queued)
+}
+
+// lockedError returns an error wrapping swaputil.ErrModelLocked when evict
+// holds a locked model, or nil when target can start without unloading one.
+func (s *FIFO) lockedError(target string, evict []string) error {
+	var locked []string
+	for _, id := range evict {
+		if s.effects.Locked(id) {
+			locked = append(locked, id)
+		}
+	}
+	if len(locked) == 0 {
+		return nil
+	}
+	s.logger.Infof("%s: rejecting request for model %s, it would unload locked %v", s.name, target, locked)
+	return fmt.Errorf("%w: loading %s would unload locked model %s", swaputil.ErrModelLocked, target, strings.Join(locked, ", "))
 }
 
 // runningSet is the live model set handed to the Swapper: every process the

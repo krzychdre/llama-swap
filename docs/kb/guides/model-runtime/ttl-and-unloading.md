@@ -1,10 +1,10 @@
 ---
 title: Automatic model unloading with ttl
-summary: How ttl, globalTTL, unloadTimeout and Docker cmdStop interact, plus how to unload on demand or pause inference.
+summary: How ttl, globalTTL, unloadTimeout and Docker cmdStop interact, plus how to unload on demand, pause inference or lock a model.
 category: guides
-tags: [ttl, unload, vram, memory, idle, docker, container, cmd-stop, pause, resume, gaming]
+tags: [ttl, unload, vram, memory, idle, docker, container, cmd-stop, pause, resume, gaming, lock, swap]
 config_keys: [globalTTL, unloadTimeout, models.*.ttl, models.*.unloadTimeout, models.*.cmdStop, models.*.compat.ignoreWebsockets]
-updated: 2026-11-04
+updated: 2026-11-23
 ---
 
 # Automatic model unloading with ttl
@@ -108,6 +108,32 @@ While paused, every request for a local model (`/v1/...`, `/upstream/...`,
 `all inference is paused`, and startup preloading is skipped. Requests that
 are running when you pause are stopped with their model. Peer models are not
 affected. A config reload keeps the pause; restarting llama-swap clears it.
+
+## Locking a model
+
+A request loads whatever model it names, so one stray request (a client with
+an old model name, a tool that picks its own default) can swap out the model
+you are working with. Lock that model to prevent it:
+
+```console
+$ curl -X POST http://localhost:8080/api/models/lock/qwen-coder
+$ curl -X POST http://localhost:8080/api/models/unlock/qwen-coder
+```
+
+The Models page has a padlock button per model that does the same.
+
+A request whose model can only start by unloading a locked model fails at
+once with `423 Locked`, error code `model_locked` and a message naming the
+locked model. Nothing is stopped or started, and no loading stream is sent. A
+request already waiting in the queue gets the same error when its turn comes.
+Requests for the locked model, and for models that can run next to it, are
+served as usual. The status is 423 rather than 409 because OpenAI client
+libraries retry 409 on their own.
+
+A lock only blocks requests. Unloading the model by hand, Unload All, Pause
+and its `ttl` still stop it; give it `ttl: 0` if it should also survive idle
+periods. A model can be locked while stopped; the lock matters once it is
+loaded. A config reload keeps locks; restarting llama-swap clears them.
 
 ## Picking a value
 

@@ -256,8 +256,9 @@ func main() {
 	})
 
 	// Shared the same way, so a config reload while inference is paused
-	// keeps it paused (issue #1268).
+	// keeps it paused (issue #1268) and locked models stay locked.
 	pauseState := server.NewPauseState()
+	modelLocks := server.NewModelLocks()
 
 	initialStorePaths := configStorePaths(cfg)
 	initialStore, err := openStore(initialStorePaths)
@@ -266,7 +267,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	initialSrv, err := server.New(cfg, logs, perfMon, initialStore, buildInfo, hardwareSnapshot, referenceDocs, sourceCode, pauseState)
+	initialSrv, err := server.New(cfg, logs, perfMon, initialStore, buildInfo, hardwareSnapshot, referenceDocs, sourceCode, pauseState, modelLocks)
 	if err != nil {
 		slog.Error("failed to create server", "error", err)
 		initialStore.Close()
@@ -374,7 +375,7 @@ func main() {
 			}
 		}
 
-		newSrv, err := server.New(newCfg, logs, perfMon, newStore, buildInfo, hardwareSnapshot, referenceDocs, sourceCode, pauseState)
+		newSrv, err := server.New(newCfg, logs, perfMon, newStore, buildInfo, hardwareSnapshot, referenceDocs, sourceCode, pauseState, modelLocks)
 		if err != nil {
 			proxyLog.Warnf("failed to build new server during reload: %v", err)
 			if storeChanged {

@@ -35,7 +35,9 @@ type apiModel struct {
 	Capabilities map[string]any `json:"capabilities,omitempty"`
 	// SleepWakeEnabled marks models that can be put to sleep and woken.
 	SleepWakeEnabled bool `json:"sleepWakeEnabled,omitempty"`
-	ContextLength    int  `json:"context_length,omitempty"`
+	// Locked marks models that requests for other models may not evict.
+	Locked        bool `json:"locked,omitempty"`
+	ContextLength int  `json:"context_length,omitempty"`
 	// ReadySince is when the model last became ready (RFC 3339). Only set
 	// while the model is ready.
 	ReadySince string `json:"readySince,omitempty"`
@@ -184,6 +186,7 @@ func (s *Server) modelStatus() []apiModel {
 			Capabilities:     capsMap,
 			Modalities:       modalities,
 			SleepWakeEnabled: mc.SleepWake.Enabled,
+			Locked:           s.locks.Locked(id),
 			ContextLength:    ctxLen,
 			ReadySince:       readySince,
 			UptimeMs:         uptimeMs,
@@ -210,14 +213,8 @@ func (s *Server) handleAPIUnloadAll(w http.ResponseWriter, r *http.Request) {
 
 // handleAPIUnloadModel stops a single named local process.
 func (s *Server) handleAPIUnloadModel(w http.ResponseWriter, r *http.Request) {
-	requested := strings.TrimPrefix(r.PathValue("model"), "/")
-	realName, found := s.cfg.RealModelName(requested)
-	if !found {
-		swaputil.SendResponse(w, r, http.StatusNotFound, "model not found")
-		return
-	}
-	if !s.local.Handles(realName) {
-		swaputil.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+	realName, ok := s.resolveLocalModel(w, r)
+	if !ok {
 		return
 	}
 	s.local.Unload(0, realName)
@@ -257,10 +254,10 @@ func (s *Server) handleAPIWakeModel(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-// resolveSleepWakeModel validates that the requested model is a local model
-// with sleep/wake enabled, writing the appropriate error response and
-// returning ok=false otherwise.
-func (s *Server) resolveSleepWakeModel(w http.ResponseWriter, r *http.Request) (string, bool) {
+// resolveLocalModel resolves the {model} path value to the real name of a
+// local model, writing the appropriate error response and returning ok=false
+// otherwise.
+func (s *Server) resolveLocalModel(w http.ResponseWriter, r *http.Request) (string, bool) {
 	requested := strings.TrimPrefix(r.PathValue("model"), "/")
 	realName, found := s.cfg.RealModelName(requested)
 	if !found {
@@ -269,6 +266,16 @@ func (s *Server) resolveSleepWakeModel(w http.ResponseWriter, r *http.Request) (
 	}
 	if !s.local.Handles(realName) {
 		swaputil.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+		return "", false
+	}
+	return realName, true
+}
+
+// resolveSleepWakeModel is resolveLocalModel for a model with sleep/wake
+// enabled.
+func (s *Server) resolveSleepWakeModel(w http.ResponseWriter, r *http.Request) (string, bool) {
+	realName, ok := s.resolveLocalModel(w, r)
+	if !ok {
 		return "", false
 	}
 	if !s.cfg.Models[realName].SleepWake.Enabled {
@@ -767,6 +774,7 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			event.On(func(e swaputil.ProcessLoadingEvent) { sendModels() }),
 			event.On(func(e swaputil.ModelCapabilitiesChangedEvent) { sendModels() }),
 			event.On(func(e swaputil.ConfigFileChangedEvent) { sendModels() }),
+			event.On(func(e swaputil.ModelLockChangedEvent) { sendModels() }),
 			event.On(func(e swaputil.ProfileChangedEvent) {
 				sendProfile()
 				sendModels()

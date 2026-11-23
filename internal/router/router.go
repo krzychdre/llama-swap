@@ -81,4 +81,9 @@ type LocalRouter interface {
 	// process. While it returns an error no model starts, and the requests
 	// that needed one get that error.
 	SetStartGate(gate func() error)
+
+	// SetLockCheck installs a check that reports whether a model is locked.
+	// A request that would evict a locked model is rejected with an error
+	// wrapping swaputil.ErrModelLocked instead of swapping it out.
+	SetLockCheck(locked func(modelID string) bool)
 }

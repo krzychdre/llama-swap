@@ -80,6 +80,8 @@ func errorTypeForStatus(status int) (errType string, code string) {
 		return ErrorTypeInvalidRequest, "not_found"
 	case http.StatusConflict:
 		return ErrorTypeInvalidRequest, "conflict"
+	case http.StatusLocked:
+		return ErrorTypeInvalidRequest, "model_locked"
 	case http.StatusTooManyRequests:
 		return ErrorTypeRateLimit, "rate_limit_exceeded"
 	case http.StatusBadGateway:

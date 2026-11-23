@@ -69,6 +69,10 @@ type baseRouter struct {
 	// get the error. See SetStartGate.
 	startGate atomic.Pointer[func() error]
 
+	// lockCheck, when set, reports whether a model is locked against
+	// eviction. See SetLockCheck.
+	lockCheck atomic.Pointer[func(modelID string) bool]
+
 	// testProcessed, when non-nil, receives one event after each handlerReq
 	// or swapDone has been fully processed by run(). Tests use it to wait
 	// for run() to reach a deterministic state without sleeping. serveDone
@@ -198,6 +202,19 @@ func (b *baseRouter) SetStartGate(gate func() error) {
 		return
 	}
 	b.startGate.Store(&gate)
+}
+
+// SetLockCheck installs the check the scheduler asks before evicting a model.
+// A request whose swap would evict a locked model is rejected; unloads, TTL
+// expiry and shutdown still stop locked models.
+func (b *baseRouter) SetLockCheck(locked func(modelID string) bool) {
+	b.lockCheck.Store(&locked)
+}
+
+// Locked implements scheduler.Effects.
+func (b *baseRouter) Locked(modelID string) bool {
+	locked := b.lockCheck.Load()
+	return locked != nil && (*locked)(modelID)
 }
 
 // StartSwap implements scheduler.Effects, launching the swap goroutine.
