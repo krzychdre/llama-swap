@@ -191,7 +191,7 @@ models:
 
 	pause := NewPauseState()
 	pause.set(true)
-	s, err := New(cfg, logmon.NewGroup(io.Discard, true, true, true), nil, st, BuildInfo{}, nil, nil, nil, pause)
+	s, err := New(cfg, logmon.NewGroup(io.Discard, true, true, true), nil, st, BuildInfo{}, nil, nil, nil, pause, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -221,7 +221,7 @@ models:
 	}
 	defer st.Close()
 
-	s, err := New(cfg, logmon.NewGroup(io.Discard, true, true, true), nil, st, BuildInfo{}, nil, nil, nil, nil)
+	s, err := New(cfg, logmon.NewGroup(io.Discard, true, true, true), nil, st, BuildInfo{}, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

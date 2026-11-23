@@ -495,6 +495,22 @@ export async function wakeModel(model: string): Promise<void> {
   }
 }
 
+/** Locks a model so requests for other models cannot unload it, or unlocks it. */
+export async function setModelLocked(model: string, locked: boolean): Promise<void> {
+  const action = locked ? "lock" : "unlock";
+  try {
+    const response = await fetch(apiUrl(`/api/models/${action}/${model}`), {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to ${action} model: ${response.status}`);
+    }
+  } catch (error) {
+    console.error(`Failed to ${action} model`, model, error);
+    throw error;
+  }
+}
+
 export async function cancelInflightRequest(id: string): Promise<void> {
   try {
     const response = await fetch(apiUrl(`/api/inflight/${encodeURIComponent(id)}/cancel`), {

@@ -228,6 +228,7 @@ type Effects interface {
     GrantError(req HandlerReq, err error)
     GrantServe(req HandlerReq, modelID string) bool
     StopProcesses(timeout time.Duration, ids []string)
+    Locked(modelID string) bool
 }
 ```
 
@@ -293,7 +294,7 @@ interface buys three things:
    `On*` methods directly and assert on a `fakeEffects` that just records the
    calls — synchronous, deterministic, no sleeps. (`scheduler/fifo_test.go`.)
 2. **A single, auditable side-effect surface.** Every externally-visible thing a
-   scheduler can do is one of six methods. You can reason about the whole
+   scheduler can do is one of seven methods. You can reason about the whole
    contract by reading one interface.
 3. **Decoupling lifetime.** The scheduler never holds a `process.Process`,
    never sees a channel, and never learns how shutdown teardown works. It only
@@ -332,6 +333,12 @@ Method by method, as implemented in `base.go`:
   guarantee the process is dead by the time it returns. (Note `StartSwap` is
   async but `StopProcesses` is sync — the difference is deliberate and tied to
   the caller's expectations.)
+
+- **`Locked(modelID)`**: whether the model is locked against eviction, through
+  the check the server installs with `SetLockCheck`. The scheduler asks it for
+  every model a new or queued request would evict and rejects the request with
+  `swaputil.ErrModelLocked` when one is locked. A request joining a swap
+  already in flight is not checked again: that eviction is under way.
 
 A useful way to hold it in your head: `Effects` is the scheduler's syscall
 table. The scheduler is a pure state machine; `Effects` is how it touches the

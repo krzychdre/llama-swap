@@ -109,6 +109,9 @@ type Effects interface {
 	// StopProcesses stops the named processes in parallel and blocks until all
 	// have stopped. Unknown IDs are skipped.
 	StopProcesses(timeout time.Duration, ids []string)
+	// Locked reports whether modelID is locked: a request that would evict
+	// it is rejected instead of swapping it out.
+	Locked(modelID string) bool
 }
 
 // New returns a Scheduler selected by conf.Routing.Scheduler.Use, configured

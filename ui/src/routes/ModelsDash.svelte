@@ -19,6 +19,7 @@
   import type { Model } from "../lib/types";
   import ModelLoadButton from "../components/ModelLoadButton.svelte";
   import ModelSleepWakeButton from "../components/ModelSleepWakeButton.svelte";
+  import ModelLockButton from "../components/ModelLockButton.svelte";
   import Tag from "../components/Tag.svelte";
   import * as Card from "$lib/components/ui/card/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
@@ -153,6 +154,7 @@
       >
         <ExternalLink class="size-4" />
       </a>
+      <ModelLockButton {model} />
       <ModelSleepWakeButton {model} />
       <ModelLoadButton {model} />
     {/if}

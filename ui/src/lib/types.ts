@@ -42,6 +42,8 @@ export interface Model {
   playgroundType?: PlaygroundModelType;
   aliases?: string[];
   sleepWakeEnabled?: boolean;
+  // requests for other models may not unload a locked model
+  locked?: boolean;
   capabilities?: ModelCapabilities;
   modalities?: ModelModalities;
   context_length?: number;

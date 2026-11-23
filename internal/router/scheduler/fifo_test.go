@@ -64,6 +64,7 @@ type fakeEffects struct {
 	grants    []grantRec
 	stops     []stopRec
 	cancelled map[uint64]bool
+	locked    map[string]bool
 }
 
 func newFakeEffects() *fakeEffects {
@@ -71,6 +72,7 @@ func newFakeEffects() *fakeEffects {
 		states:      map[string]process.ProcessState{},
 		serveResult: map[string]bool{},
 		cancelled:   map[uint64]bool{},
+		locked:      map[string]bool{},
 	}
 }
 
@@ -122,6 +124,8 @@ func (f *fakeEffects) GrantServe(req HandlerReq, modelID string) bool {
 func (f *fakeEffects) StopProcesses(timeout time.Duration, ids []string) {
 	f.stops = append(f.stops, stopRec{timeout: timeout, ids: ids})
 }
+
+func (f *fakeEffects) Locked(modelID string) bool { return f.locked[modelID] }
 
 // served counts grants that handed modelID a handler and were received.
 func (f *fakeEffects) served(modelID string) int {
@@ -1078,5 +1082,78 @@ func TestFIFO_Evictions(t *testing.T) {
 	}
 	if len(eff.starts) != startsBefore || len(eff.stops) != 0 {
 		t.Errorf("Evictions must not start or stop anything")
+	}
+}
+
+// lockedSetup has a ready, a stopped b, and a planner where loading b evicts a.
+func lockedSetup() (*FIFO, *fakeEffects) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	return newFIFO(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff), eff
+}
+
+func TestFIFO_LockedModel_RejectsEvictingRequest(t *testing.T) {
+	s, eff := lockedSetup()
+	eff.locked["a"] = true
+
+	rb := req("b")
+	s.OnRequest(rb)
+	if err := admitErr(t, rb); !errors.Is(err, swaputil.ErrModelLocked) {
+		t.Fatalf("admission err=%v want ErrModelLocked", err)
+	}
+	if got := eff.startsFor("b"); got != 0 {
+		t.Fatalf("StartSwap(b)=%d want 0 while a is locked", got)
+	}
+
+	delete(eff.locked, "a")
+	rb = req("b")
+	s.OnRequest(rb)
+	assertAdmitted(t, rb)
+	if got := eff.startsFor("b"); got != 1 {
+		t.Fatalf("StartSwap(b)=%d want 1 after unlocking a", got)
+	}
+}
+
+// TestFIFO_LockedModel_RejectsQueuedRequest covers a request queued behind a
+// busy model that gets locked before the queue drains.
+func TestFIFO_LockedModel_RejectsQueuedRequest(t *testing.T) {
+	s, eff := lockedSetup()
+
+	s.OnRequest(req("a")) // fast path, a in flight
+	rb := req("b")
+	s.OnRequest(rb) // would evict busy a -> queued
+	assertAdmitted(t, rb)
+
+	eff.locked["a"] = true
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+
+	if got := eff.errored("b"); got != 1 {
+		t.Fatalf("errored(b)=%d want 1", got)
+	}
+	if err := eff.grants[len(eff.grants)-1].err; !errors.Is(err, swaputil.ErrModelLocked) {
+		t.Fatalf("grant err=%v want ErrModelLocked", err)
+	}
+	if got := eff.startsFor("b"); got != 0 {
+		t.Fatalf("StartSwap(b)=%d want 0", got)
+	}
+}
+
+// TestFIFO_LockedModel_JoinsStartedSwap checks that a lock set after a swap
+// started does not reject requests joining it: the eviction is under way.
+func TestFIFO_LockedModel_JoinsStartedSwap(t *testing.T) {
+	s, eff := lockedSetup()
+
+	s.OnRequest(req("b")) // StartSwap(b) evicting a
+	eff.locked["a"] = true
+	rb := req("b")
+	s.OnRequest(rb)
+	assertAdmitted(t, rb)
+
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateReady
+	s.OnSwapDone(eff.swapDone("b", nil))
+	if got := eff.served("b"); got != 2 {
+		t.Fatalf("served(b)=%d want 2", got)
 	}
 }
